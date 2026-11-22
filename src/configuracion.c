@@ -205,11 +205,9 @@ static bool cerrar_objeto(LectorJson *json, const char *const *campos, size_t ca
 #define CANTIDAD(campos) (sizeof (campos) / sizeof (campos)[0])
 
 static bool leer_tienda(LectorJson *json, ConfigTienda *tienda, int cadena) {
-    const char *const independientes[] = {"id", "historial", "meta"};
-    const char *const agrupadas[] = {"id", "historial", "direccion", "puerto"};
+    const char *const campos[] = {"id", "historial", "direccion", "puerto", "meta"};
     bool suelta = cadena == CONFIG_SIN_CADENA;
-    const char *const *campos = suelta ? independientes : agrupadas;
-    size_t cantidad = suelta ? CANTIDAD(independientes) : CANTIDAD(agrupadas);
+    size_t cantidad = suelta ? CANTIDAD(campos) : CANTIDAD(campos) - 1;
     unsigned vistos = 0;
     tienda->cadena = cadena;
 
@@ -235,18 +233,12 @@ static bool leer_tienda(LectorJson *json, ConfigTienda *tienda, int cadena) {
             }
             break;
         case 2:
-            if (suelta) {
-                if (!leer_entero(json, 1, INT64_MAX, &tienda->meta)) {
-                    return false;
-                }
-            } else {
-                if (!leer_texto(json, tienda->direccion, sizeof tienda->direccion)) {
-                    return false;
-                }
-                if (inet_pton(AF_INET, tienda->direccion, &direccion) != 1 ||
-                    direccion.s_addr == htonl(INADDR_ANY)) {
-                    return fallar(json, "se esperaba una dirección IPv4 concreta");
-                }
+            if (!leer_texto(json, tienda->direccion, sizeof tienda->direccion)) {
+                return false;
+            }
+            if (inet_pton(AF_INET, tienda->direccion, &direccion) != 1 ||
+                direccion.s_addr == htonl(INADDR_ANY)) {
+                return fallar(json, "se esperaba una dirección IPv4 concreta");
             }
             break;
         case 3:
@@ -255,10 +247,19 @@ static bool leer_tienda(LectorJson *json, ConfigTienda *tienda, int cadena) {
             }
             tienda->puerto = (uint16_t)puerto;
             break;
+        case 4:
+            if (!leer_entero(json, 1, INT64_MAX, &tienda->meta)) {
+                return false;
+            }
+            break;
         default:
             return false;
         }
     } while (tomar(json, ','));
+    if (suelta && !tienda->direccion[0] && !tienda->puerto) {
+        // El par completo es opcional para mantener los JSON anteriores.
+        vistos |= (1u << 2) | (1u << 3);
+    }
     return cerrar_objeto(json, campos, cantidad, vistos);
 }
 
@@ -498,9 +499,7 @@ static bool validar_duplicados(Configuracion *config, const char *directorio,
                 repetido = "id";
             } else if (strcmp(tienda->historial, anterior->historial) == 0) {
                 repetido = "historial";
-            } else if (tienda->cadena != CONFIG_SIN_CADENA &&
-                       anterior->cadena != CONFIG_SIN_CADENA &&
-                       tienda->puerto == anterior->puerto &&
+            } else if (tienda->puerto && tienda->puerto == anterior->puerto &&
                        strcmp(tienda->direccion, anterior->direccion) == 0) {
                 repetido = "dirección y puerto";
             }

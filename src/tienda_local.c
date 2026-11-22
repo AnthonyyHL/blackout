@@ -13,9 +13,26 @@ enum {
     TAM_BLOQUE = 1024
 };
 
-static bool aplicar_registro(TiendaLocal *tienda, const char *registro) {
-    if (tienda->cerrada_por_meta || registro[0] < '1' || registro[0] > '9') {
+static bool reservar_venta(TiendaLocal *tienda) {
+    if (!tienda->indexar || tienda->cantidad < tienda->capacidad) {
+        return true;
+    }
+    if (tienda->capacidad > SIZE_MAX / sizeof *tienda->ventas / 2) {
         return false;
+    }
+    size_t capacidad = tienda->capacidad ? tienda->capacidad * 2 : 16;
+    int64_t *ventas = realloc(tienda->ventas, capacidad * sizeof *ventas);
+    if (!ventas) {
+        return false;
+    }
+    tienda->ventas = ventas;
+    tienda->capacidad = capacidad;
+    return true;
+}
+
+static ResultadoTiendaLocal aplicar_registro(TiendaLocal *tienda, const char *registro) {
+    if (tienda->cerrada_por_meta || registro[0] < '1' || registro[0] > '9') {
+        return TIENDA_HISTORIAL_INVALIDO;
     }
 
     char *fin;
@@ -23,12 +40,17 @@ static bool aplicar_registro(TiendaLocal *tienda, const char *registro) {
     intmax_t importe = strtoimax(registro, &fin, 10);
     if (errno == ERANGE || importe > INT64_MAX - tienda->ingreso_propio ||
         fin[0] != ' ' || (fin[1] != '0' && fin[1] != '1') || fin[2] != '\0') {
-        return false;
+        return TIENDA_HISTORIAL_INVALIDO;
     }
-
+    if (!reservar_venta(tienda)) {
+        return TIENDA_SIN_MEMORIA;
+    }
+    if (tienda->indexar) {
+        tienda->ventas[tienda->cantidad++] = (int64_t)importe;
+    }
     tienda->ingreso_propio += (int64_t)importe;
     tienda->cerrada_por_meta = fin[1] == '1';
-    return true;
+    return TIENDA_OK;
 }
 
 static ResultadoTiendaLocal reconstruir_historial(TiendaLocal *tienda) {
@@ -50,8 +72,9 @@ static ResultadoTiendaLocal reconstruir_historial(TiendaLocal *tienda) {
             char byte = bloque[i];
             if (byte == '\n') {
                 registro[usados] = '\0';
-                if (!aplicar_registro(tienda, registro)) {
-                    return TIENDA_HISTORIAL_INVALIDO;
+                ResultadoTiendaLocal resultado = aplicar_registro(tienda, registro);
+                if (resultado != TIENDA_OK) {
+                    return resultado;
                 }
                 usados = 0;
             } else {
@@ -66,8 +89,8 @@ static ResultadoTiendaLocal reconstruir_historial(TiendaLocal *tienda) {
     return usados == 0 ? TIENDA_OK : TIENDA_HISTORIAL_INVALIDO;
 }
 
-ResultadoTiendaLocal tienda_local_abrir(TiendaLocal *tienda, const char *ruta,
-                                        int64_t meta) {
+static ResultadoTiendaLocal abrir(TiendaLocal *tienda, const char *ruta, int64_t meta,
+                                  bool indexar, bool historico) {
     if (tienda == NULL || tienda->fd_historial >= 0 ||
         ruta == NULL || ruta[0] == '\0' || meta <= 0) {
         return TIENDA_PARAMETRO_INVALIDO;
@@ -75,7 +98,9 @@ ResultadoTiendaLocal tienda_local_abrir(TiendaLocal *tienda, const char *ruta,
 
     TiendaLocal nueva = TIENDA_LOCAL_INICIAL;
     nueva.meta = meta;
-    nueva.fd_historial = open(ruta, O_RDWR | O_CREAT | O_APPEND, 0600);
+    nueva.indexar = indexar;
+    int opciones = historico ? O_RDONLY | O_NONBLOCK : O_RDWR | O_CREAT | O_APPEND;
+    nueva.fd_historial = open(ruta, opciones, 0600);
     if (nueva.fd_historial < 0) {
         return TIENDA_ERROR_APERTURA;
     }
@@ -88,17 +113,28 @@ ResultadoTiendaLocal tienda_local_abrir(TiendaLocal *tienda, const char *ruta,
 
     ResultadoTiendaLocal resultado = reconstruir_historial(&nueva);
     // La marca histórica mantiene el cierre aunque cambie la meta de prueba.
-    if (resultado == TIENDA_OK && !nueva.cerrada_por_meta &&
+    if (resultado == TIENDA_OK && !historico && !nueva.cerrada_por_meta &&
         nueva.ingreso_propio >= meta) {
         resultado = TIENDA_META_INCOMPATIBLE;
     }
     if (resultado != TIENDA_OK) {
         close(nueva.fd_historial);
+        free(nueva.ventas);
         return resultado;
     }
 
     *tienda = nueva;
     return TIENDA_OK;
+}
+
+ResultadoTiendaLocal tienda_local_abrir(TiendaLocal *tienda, const char *ruta, int64_t meta) {
+    return abrir(tienda, ruta, meta, false, false);
+}
+
+/* Reconstruye los importes por posición. El modo histórico abre solo para lectura. */
+ResultadoTiendaLocal tienda_local_abrir_consulta(TiendaLocal *tienda, const char *ruta,
+                                                 int64_t meta, bool historico) {
+    return abrir(tienda, ruta, meta, true, historico);
 }
 
 ResultadoTiendaLocal tienda_local_registrar(TiendaLocal *tienda, int64_t importe) {
@@ -127,6 +163,10 @@ ResultadoTiendaLocal tienda_local_registrar(TiendaLocal *tienda, int64_t importe
     if (longitud < 0 || (size_t)longitud >= sizeof registro) {
         return TIENDA_ERROR_ESCRITURA;
     }
+    // Si falta memoria, se rechaza antes de escribir una venta que no se podría consultar.
+    if (!reservar_venta(tienda)) {
+        return TIENDA_SIN_MEMORIA;
+    }
 
     size_t escritos = 0;
     size_t total = (size_t)longitud;
@@ -146,6 +186,9 @@ ResultadoTiendaLocal tienda_local_registrar(TiendaLocal *tienda, int64_t importe
 
     tienda->ingreso_propio = ingreso_nuevo;
     tienda->cerrada_por_meta = alcanza_meta;
+    if (tienda->indexar) {
+        tienda->ventas[tienda->cantidad++] = importe;
+    }
     return TIENDA_OK;
 }
 
@@ -156,5 +199,8 @@ ResultadoTiendaLocal tienda_local_cerrar(TiendaLocal *tienda) {
 
     int descriptor = tienda->fd_historial;
     tienda->fd_historial = -1;
+    free(tienda->ventas);
+    tienda->ventas = NULL;
+    tienda->cantidad = tienda->capacidad = 0;
     return close(descriptor) == 0 ? TIENDA_OK : TIENDA_ERROR_CIERRE;
 }

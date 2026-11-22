@@ -13,5 +13,7 @@
 int tienda_cadena_ejecutar(const Configuracion *config, const ConfigTienda *tienda,
                           const ConfigTienda *entrada);
 int tienda_cadena_consultar_cierre(const Configuracion *config, const ConfigTienda *tienda);
+int tienda_independiente_ejecutar(const Configuracion *config, const ConfigTienda *tienda);
+int tienda_consultar_historial(const Configuracion *config, const ConfigTienda *tienda, bool ventas);
 
 #endif

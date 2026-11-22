@@ -1,4 +1,5 @@
 #include "configuracion.h"
+#include "monitor.h"
 #include "red.h"
 #include "tienda_cadena.h"
 
@@ -14,8 +15,24 @@
 int main(int argc, char *argv[]) {
     bool modo_cadena = argc >= 4 && strcmp(argv[3], "--cadena") == 0;
     bool solo_cierre = argc == 4 && strcmp(argv[3], "--consultar-cierre") == 0;
-    if (argc != 3 && argc != 5 && !(argc == 4 && (modo_cadena || solo_cierre))) {
-        fprintf(stderr, "Uso: %s config.json ID_TIENDA [ID_PAR IMPORTE_CENTAVOS | --cadena [PAR_INICIAL] | --consultar-cierre]\n",
+    bool modo_independiente = argc == 4 && strcmp(argv[3], "--independiente") == 0;
+    bool modo_monitor = argc >= 4 && strcmp(argv[3], "--monitor") == 0;
+    bool ventas = false, historico = false;
+    int opcion;
+    for (opcion = 4; modo_monitor && opcion < argc; ++opcion) {
+        if (!ventas && strcmp(argv[opcion], "--ventas") == 0) {
+            ventas = true;
+        } else if (!historico && strcmp(argv[opcion], "--historial") == 0) {
+            historico = true;
+        } else {
+            break;
+        }
+    }
+    bool uso_valido = modo_monitor ? opcion == argc
+                     : argc == 3 || argc == 5 || (argc == 4 && (modo_cadena || solo_cierre || modo_independiente));
+    if (!uso_valido) {
+        fprintf(stderr, "Uso: %s config.json ID_TIENDA [ID_PAR IMPORTE_CENTAVOS | --cadena [PAR_INICIAL] | "
+                        "--independiente | --monitor [--ventas] [--historial] | --consultar-cierre]\n",
                 argv[0]);
         return EXIT_FAILURE;
     }
@@ -26,8 +43,12 @@ int main(int argc, char *argv[]) {
         return EXIT_FAILURE;
     }
     const ConfigTienda *tienda = configuracion_buscar(&config, argv[2]);
-    if (!tienda || tienda->cadena == CONFIG_SIN_CADENA) {
-        fprintf(stderr, "ID de tienda de cadena inválido: %s\n", argv[2]);
+    if (!tienda || (!modo_monitor && (tienda->cadena == CONFIG_SIN_CADENA) != modo_independiente)) {
+        fprintf(stderr, "ID de tienda inválido para este modo: %s\n", argv[2]);
+        return EXIT_FAILURE;
+    }
+    if (modo_independiente && !tienda->puerto) {
+        fprintf(stderr, "%s requiere direccion y puerto para escuchar.\n", tienda->id);
         return EXIT_FAILURE;
     }
 
@@ -39,7 +60,7 @@ int main(int argc, char *argv[]) {
             fprintf(stderr, "Par inicial de cadena inválido\n");
             return EXIT_FAILURE;
         }
-    } else if (argc == 5) {
+    } else if (!modo_monitor && argc == 5) {
         destino = configuracion_buscar(&config, argv[3]);
         char *fin;
         errno = 0;
@@ -65,6 +86,14 @@ int main(int argc, char *argv[]) {
     if (solo_cierre) {
         setvbuf(stdout, NULL, _IOLBF, 0);
         return tienda_cadena_consultar_cierre(&config, tienda);
+    }
+    if (modo_monitor) {
+        return historico ? tienda_consultar_historial(&config, tienda, ventas)
+                         : monitor_mostrar(&config, tienda, ventas, NULL, NULL);
+    }
+    if (modo_independiente) {
+        setvbuf(stdout, NULL, _IOLBF, 0);
+        return tienda_independiente_ejecutar(&config, tienda);
     }
     ServidorRed servidor = {.escucha = red_escuchar(tienda), .config = &config, .tienda = tienda};
     if (servidor.escucha == -1) {

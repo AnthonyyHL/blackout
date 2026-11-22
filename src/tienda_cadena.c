@@ -2,6 +2,8 @@
 #include "red.h"
 #include "recuperacion.h"
 #include "cierre.h"
+#include "monitor.h"
+#include "tienda_local.h"
 
 #include <errno.h>
 #include <fcntl.h>
@@ -67,8 +69,9 @@ typedef struct {
     const Configuracion *config;
     const ConfigTienda *tienda;
     const char *id_cadena;
+    TiendaLocal *local;
     int historial;
-    bool historial_dudoso;
+    bool historial_dudoso, historico;
     // Cada posición de incorporación contiene un índice de config->tiendas.
     unsigned char orden[CONFIG_MAX_TIENDAS];
     size_t cantidad, cantidad_configurada, propia;
@@ -88,6 +91,8 @@ typedef struct {
     size_t cotejadas;
     EvidenciaCierre cierre, borrador;
 } Cadena;
+
+static size_t turno_pendiente(const Cadena *cadena, const Venta *venta, size_t *previa);
 
 static volatile sig_atomic_t avisar_fin = -1;
 
@@ -1063,10 +1068,98 @@ static bool atender_cierre(Cadena *cadena, char *campos[CAMPOS], size_t n, char 
     return false;
 }
 
+static char estado_monitoreado(const Cadena *cadena) {
+    if (cadena->local) {
+        if (cadena->local->historial_por_verificar) {
+            return 'H';
+        }
+        return cadena->local->cerrada_por_meta ? 'M' : cadena->historico ? 'I' : 'A';
+    }
+    if (cadena->historial_dudoso) {
+        return 'H';
+    }
+    if (cadena->definitiva) {
+        return cadena->solo_lectura ? 'm' : 'M';
+    }
+    if (cadena->cierre.version) {
+        return 'P';
+    }
+    if (cadena->cerrando) {
+        return 'C';
+    }
+    if (cadena->historico) {
+        return cadena->reiniciada ? 'R' : 'I';
+    }
+    return cadena->lista && !cadena->reiniciada && !cadena->cambio.version ? 'A' : 'R';
+}
+
+/* Cuenta ventas propias que aún requieren un ACK en la vista instalada. */
+static size_t pendientes_propias(const Cadena *cadena) {
+    size_t pendientes = 0;
+    for (size_t i = 0; i < cadena->usadas; ++i) {
+        const Venta *venta = &cadena->ventas[i];
+        size_t previa;
+        if (venta->origen == cadena->propia && turno_pendiente(cadena, venta, &previa) < cadena->cantidad) {
+            ++pendientes;
+        }
+    }
+    return pendientes;
+}
+
+/* Responde desde el propietario. El resumen fija el límite de la enumeración. */
+static bool atender_monitor(Cadena *cadena, char *campos[CAMPOS], size_t cantidad, char *respuesta) {
+    if (!cantidad || (strcmp(campos[0], "ESTADO") != 0 && strcmp(campos[0], "VENTA_PROPIA") != 0)) {
+        return false;
+    }
+    bool resumen = strcmp(campos[0], "ESTADO") == 0;
+    if (cantidad != (resumen ? 3u : 4u) || strcmp(campos[1], cadena->tienda->id) != 0 ||
+        strcmp(campos[2], cadena->id_cadena) != 0) {
+        return true;
+    }
+    int64_t ultima = cadena->local ? (int64_t)cadena->local->cantidad : cadena->secuencia;
+    if (resumen) {
+        char total[24] = "-", pendientes[24] = "-";
+        int64_t propio = cadena->local ? cadena->local->ingreso_propio : cadena->ingreso_propio;
+        if (!cadena->local) {
+            snprintf(total, sizeof total, "%" PRId64, cadena->total);
+            if (!cadena->historico && cadena->version && !cadena->definitiva) {
+                snprintf(pendientes, sizeof pendientes, "%zu", pendientes_propias(cadena));
+            }
+        }
+        snprintf(respuesta, RED_MAX_LINEA + 1, "ESTADO %s %c %" PRId64 " %s %s %" PRId64 "\n",
+                 cadena->tienda->id, estado_monitoreado(cadena), propio, total, pendientes, ultima);
+    } else {
+        int64_t indice;
+        if (numero(campos[3], &indice) && indice > 0 && indice <= ultima) {
+            const Venta *venta = cadena->local ? NULL : venta_por_id(cadena, cadena->propia, indice);
+            if (cadena->local || venta) {
+                int64_t importe = cadena->local ? cadena->local->ventas[indice - 1] : venta->importe;
+                snprintf(respuesta, RED_MAX_LINEA + 1, "PROPIA %" PRId64 " %" PRId64 "\n", indice, importe);
+            }
+        }
+    }
+    return true;
+}
+
 static void atender(Cadena *cadena, char *linea, char *respuesta) {
     char *campos[CAMPOS];
     size_t cantidad = separar(linea, campos);
     strcpy(respuesta, "ERROR\n");
+    if (atender_monitor(cadena, campos, cantidad, respuesta)) {
+        return;
+    }
+    if (cadena->local) {
+#ifdef PRUEBA_MONITOR
+        // Las compras controladas ejercitan el mismo propietario durante el ensayo.
+        int64_t importe;
+        if (cantidad == 2 && strcmp(campos[0], "COMPRA_LOCAL_PRUEBA") == 0 &&
+            numero(campos[1], &importe) && tienda_local_registrar(cadena->local, importe) == TIENDA_OK) {
+            strcpy(respuesta, "ADMITIDA\n");
+            cadena->salir = cadena->local->cerrada_por_meta;
+        }
+#endif
+        return;
+    }
     if (cantidad == 3 && strcmp(campos[0], "COMPRA") == 0) {
         if (cadena->solo_lectura || cadena->definitiva) {
             strcpy(respuesta, "CERRADA_META\n");
@@ -1396,24 +1489,24 @@ static bool enviar_canal(Canal *canal) {
  * guarda el avance de ese canal y sigue atendiendo los demás. Devuelve true
  * si se solicita salir y false si falla el servicio.
  */
-static bool atender_canales(Cadena *cadena, Canal canales[TRABAJADORES], int fin) {
+static bool atender_canales(Cadena *cadena, Canal canales[TRABAJADORES], size_t activos, int fin) {
     for (;;) {
         // Entrega las respuestas ya formadas antes de cerrar los pipes.
         if (cadena->salir && !canales[0].enviar && !canales[1].enviar) {
             return true;
         }
-        int espera = programar(cadena, &canales[EMISOR]);
+        int espera = activos == TRABAJADORES ? programar(cadena, &canales[EMISOR]) : -1;
         if (espera < -1) {
             return false;
         }
         struct pollfd fds[2 * TRABAJADORES + 1];
         fds[0] = (struct pollfd){.fd = fin, .events = POLLIN};
-        for (size_t i = 0; i < TRABAJADORES; ++i) {
+        for (size_t i = 0; i < activos; ++i) {
             fds[1 + 2 * i] = (struct pollfd){.fd = canales[i].desde_hilo[0], .events = POLLIN};
             fds[2 + 2 * i] = (struct pollfd){.fd = canales[i].enviar ? canales[i].hacia_hilo[1] : -1,
                                             .events = POLLOUT};
         }
-        int listos = poll(fds, 2 * TRABAJADORES + 1, espera);
+        int listos = poll(fds, 2 * activos + 1, espera);
         if (listos < 0 && errno != EINTR) {
             return false;
         }
@@ -1423,7 +1516,7 @@ static bool atender_canales(Cadena *cadena, Canal canales[TRABAJADORES], int fin
         if (fds[0].revents) {
             return true;
         }
-        for (size_t i = 0; i < TRABAJADORES; ++i) {
+        for (size_t i = 0; i < activos; ++i) {
             Canal *canal = &canales[i];
             if (fds[2 + 2 * i].revents && !enviar_canal(canal)) {
                 return false;
@@ -1663,12 +1756,16 @@ static bool reconstruir(Cadena *cadena, const char *cabecera) {
         return false;
     }
     if (cerrada) {
-        if (cadena->solo_lectura && cadena->cierre.version && !preparada) {
+        if (cadena->historico || (cadena->solo_lectura && cadena->cierre.version && !preparada)) {
             cadena->definitiva = true;
             return true;
         }
         fprintf(stderr, "Tienda cerrada por meta. Se conserva el historial.\n");
         return false;
+    }
+    if (cadena->historico) {
+        cadena->reiniciada = preparada || !cadena->version;
+        return true;
     }
     if (cadena->solo_lectura) {
         fprintf(stderr, "El historial no acredita una decisión de cierre.\n");
@@ -1720,6 +1817,18 @@ static bool preparar_senales(int fin[2]) {
     return sigaction(SIGINT, &accion, NULL) == 0 && sigaction(SIGTERM, &accion, NULL) == 0;
 }
 
+static Cadena iniciar_propietario(const Configuracion *config, const ConfigTienda *tienda) {
+    Cadena cadena = {.config = config, .tienda = tienda,
+                     .id_cadena = tienda->cadena == CONFIG_SIN_CADENA ? "-" : config->cadenas[tienda->cadena].id,
+                     .propia = (size_t)(tienda - config->tiendas), .en_envio = SIZE_MAX};
+    for (size_t i = 0; i < config->cantidad_tiendas; ++i) {
+        if (config->tiendas[i].cadena == tienda->cadena) {
+            ++cadena.cantidad_configurada;
+        }
+    }
+    return cadena;
+}
+
 static int ejecutar(const Configuracion *config, const ConfigTienda *tienda,
                     const ConfigTienda *entrada, bool solo_lectura) {
     int escucha = red_escuchar(tienda);
@@ -1732,16 +1841,25 @@ static int ejecutar(const Configuracion *config, const ConfigTienda *tienda,
         close(escucha);
         return EXIT_FAILURE;
     }
-    Cadena cadena = {.config = config, .tienda = tienda, .id_cadena = config->cadenas[tienda->cadena].id,
-                     .propia = (size_t)(tienda - config->tiendas), .en_envio = SIZE_MAX,
-                     .solo_lectura = solo_lectura};
-    for (size_t i = 0; i < config->cantidad_tiendas; ++i) {
-        if (config->tiendas[i].cadena == tienda->cadena) {
-            ++cadena.cantidad_configurada;
+    Cadena cadena = iniciar_propietario(config, tienda);
+    cadena.solo_lectura = solo_lectura;
+    TiendaLocal local = TIENDA_LOCAL_INICIAL;
+    if (tienda->cadena == CONFIG_SIN_CADENA) {
+        ResultadoTiendaLocal resultado = tienda_local_abrir_consulta(&local, tienda->historial, tienda->meta, false);
+        if (resultado != TIENDA_OK || local.cerrada_por_meta) {
+            fprintf(stderr, "%s: %s (%d).\n", tienda->id, local.cerrada_por_meta ? "Tienda cerrada por meta"
+                                        : "No se pudo reconstruir el historial independiente", (int)resultado);
+            if (resultado == TIENDA_OK) {
+                tienda_local_cerrar(&local);
+            }
+            close(escucha);
+            return EXIT_FAILURE;
         }
+        cadena.local = &local;
+    } else {
+        cadena.historial = abrir_historial(&cadena);
     }
-    cadena.historial = abrir_historial(&cadena);
-    if (cadena.historial == -1) {
+    if (!cadena.local && cadena.historial == -1) {
         close(escucha);
         return EXIT_FAILURE;
     }
@@ -1750,9 +1868,10 @@ static int ejecutar(const Configuracion *config, const ConfigTienda *tienda,
     Trabajador trabajadores[TRABAJADORES];
     pthread_t hilos[TRABAJADORES];
     size_t iniciados = 0;
+    size_t activos = cadena.local || solo_lectura ? RED_RECEPTORES : TRABAJADORES;
     int fin[2] = {-1, -1};
     int estado = EXIT_FAILURE;
-    for (size_t i = 0; i < TRABAJADORES; ++i) {
+    for (size_t i = 0; i < activos; ++i) {
         canales[i].desde_hilo[0] = canales[i].desde_hilo[1] = -1;
         canales[i].hacia_hilo[0] = canales[i].hacia_hilo[1] = -1;
     }
@@ -1760,7 +1879,7 @@ static int ejecutar(const Configuracion *config, const ConfigTienda *tienda,
         perror("señales de cadena");
         goto cerrar;
     }
-    for (size_t i = 0; i < TRABAJADORES; ++i) {
+    for (size_t i = 0; i < activos; ++i) {
         Canal *canal = &canales[i];
         if (pipe(canal->desde_hilo) == -1 || pipe(canal->hacia_hilo) == -1 ||
             !red_no_bloqueante(canal->desde_hilo[0]) || !red_no_bloqueante(canal->hacia_hilo[1])) {
@@ -1781,7 +1900,9 @@ static int ejecutar(const Configuracion *config, const ConfigTienda *tienda,
         ++iniciados;
     }
 
-    if (cadena.solo_lectura) {
+    if (cadena.local) {
+        printf("INDEPENDIENTE %s\n", tienda->id);
+    } else if (cadena.solo_lectura) {
         printf("CONSULTA_CIERRE %s\n", tienda->id);
     } else if (cadena.reiniciada) {
         printf("RECUPERANDO %s propio=%" PRId64 " total=%" PRId64 "\n",
@@ -1806,7 +1927,7 @@ static int ejecutar(const Configuracion *config, const ConfigTienda *tienda,
             }
         }
     }
-    if (atender_canales(&cadena, canales, fin[0])) {
+    if (atender_canales(&cadena, canales, activos, fin[0])) {
         estado = EXIT_SUCCESS;
     } else {
         fprintf(stderr, "Se interrumpió el servicio de cadena de %s\n", tienda->id);
@@ -1815,13 +1936,13 @@ static int ejecutar(const Configuracion *config, const ConfigTienda *tienda,
 cerrar:
     // El cierre de las salidas despierta a los hilos. Se esperan antes
     // de cerrar el socket y los extremos restantes.
-    for (size_t i = 0; i < TRABAJADORES; ++i) {
+    for (size_t i = 0; i < activos; ++i) {
         close(canales[i].hacia_hilo[1]);
     }
     for (size_t i = 0; i < iniciados; ++i) {
         pthread_join(hilos[i], NULL);
     }
-    for (size_t i = 0; i < TRABAJADORES; ++i) {
+    for (size_t i = 0; i < activos; ++i) {
         close(canales[i].desde_hilo[0]);
         if (i >= iniciados) {
             close(canales[i].desde_hilo[1]);
@@ -1832,7 +1953,7 @@ cerrar:
     close(fin[0]);
     close(fin[1]);
     close(escucha);
-    if (close(cadena.historial) == -1) {
+    if (cadena.local ? tienda_local_cerrar(&local) != TIENDA_OK : close(cadena.historial) == -1) {
         perror("cierre del historial");
         estado = EXIT_FAILURE;
     }
@@ -1849,4 +1970,39 @@ int tienda_cadena_ejecutar(const Configuracion *config, const ConfigTienda *tien
 
 int tienda_cadena_consultar_cierre(const Configuracion *config, const ConfigTienda *tienda) {
     return ejecutar(config, tienda, NULL, true);
+}
+
+int tienda_independiente_ejecutar(const Configuracion *config, const ConfigTienda *tienda) {
+    return ejecutar(config, tienda, NULL, false);
+}
+
+static bool consultar_historial(void *contexto, const char *linea, char *respuesta) {
+    char copia[RED_MAX_LINEA + 1];
+    strcpy(copia, linea);
+    atender(contexto, copia, respuesta);
+    return true;
+}
+
+int tienda_consultar_historial(const Configuracion *config, const ConfigTienda *tienda, bool ventas) {
+    Cadena cadena = iniciar_propietario(config, tienda);
+    cadena.solo_lectura = cadena.historico = true;
+    TiendaLocal local = TIENDA_LOCAL_INICIAL;
+    if (tienda->cadena == CONFIG_SIN_CADENA) {
+        ResultadoTiendaLocal resultado = tienda_local_abrir_consulta(&local, tienda->historial, tienda->meta, true);
+        if (resultado != TIENDA_OK) {
+            fprintf(stderr, "No se pudo leer el historial de %s (%d).\n", tienda->id, (int)resultado);
+            return EXIT_FAILURE;
+        }
+        cadena.local = &local;
+    } else if (abrir_historial(&cadena) == -1) {
+        return EXIT_FAILURE;
+    }
+    int resultado = monitor_mostrar(config, tienda, ventas, consultar_historial, &cadena);
+    if (cadena.local ? tienda_local_cerrar(&local) != TIENDA_OK : close(cadena.historial) == -1) {
+        perror("cierre del historial");
+        resultado = EXIT_FAILURE;
+    }
+    free(cadena.ventas);
+    free(cadena.cierre.items);
+    return resultado;
 }
