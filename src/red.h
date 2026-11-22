@@ -27,6 +27,8 @@ void *red_recibir(void *contexto);
  */
 bool red_intercambiar(const ConfigTienda *destino, const char *linea, char *respuesta,
                       char *error, size_t capacidad_error);
+bool red_intercambiar_hasta(const ConfigTienda *destino, const char *linea, char *respuesta,
+                            char *error, size_t capacidad_error, int64_t limite);
 bool red_enviar_prueba(const Configuracion *config, const ConfigTienda *origen,
                       const ConfigTienda *destino, int64_t importe,
                       char *error, size_t capacidad_error);

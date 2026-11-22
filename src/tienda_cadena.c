@@ -1,5 +1,6 @@
 #include "tienda_cadena.h"
 #include "red.h"
+#include "recuperacion.h"
 
 #include <errno.h>
 #include <fcntl.h>
@@ -15,7 +16,8 @@
 #include <unistd.h>
 
 enum { EMISOR = RED_RECEPTORES, TRABAJADORES = RED_RECEPTORES + 1,
-       REINTENTO_MS = 500 };
+       REINTENTO_MS = 500, CAMPOS = CONFIG_MAX_TIENDAS + 2,
+       MAX_REGISTRO = CAMPOS * (CONFIG_MAX_ID + 1) };
 
 // Cada pipe lleva registros de tamaño fijo.
 typedef struct {
@@ -24,7 +26,9 @@ typedef struct {
     unsigned char orden[CONFIG_MAX_TIENDAS];
     char linea[RED_MAX_LINEA + 1];
     char confirmacion[RED_MAX_LINEA + 1];
+    CambioLista cambio;
     bool inicio;
+    bool buscar;
     bool exito;
 } Mensaje;
 
@@ -48,8 +52,7 @@ typedef struct {
     size_t origen;
     int64_t secuencia, importe;
     char clave[CONFIG_MAX_ID + 1];
-    size_t turno;          // Siguiente posición en orden. Cadena.cantidad indica fin.
-    size_t confirmada_en;  // Posición de la última aplicación confirmada. Empieza en el origen.
+    uint64_t confirmadas;  // Un bit por identidad de config, independiente del orden actual.
     int64_t reintentar;    // Instante monotónico en ms. Cero permite intentar de inmediato.
 } Venta;
 
@@ -67,6 +70,11 @@ typedef struct {
     unsigned char orden[CONFIG_MAX_TIENDAS];
     size_t cantidad, cantidad_configurada, propia;
     bool lista;
+    uint32_t version, ultima_propuesta;
+    CambioLista cambio, encargo;
+    uint64_t verificados;
+    bool reiniciada, control_en_curso;
+    int64_t buscar_desde;
     int64_t secuencia, ingreso_propio, total;
     Venta *ventas;
     // proxima es el punto de partida de la búsqueda circular. en_envio guarda
@@ -127,14 +135,14 @@ static void *recibir(void *contexto) {
     return NULL;
 }
 
-static size_t separar(char *linea, char *campos[6]) {
+static size_t separar(char *linea, char *campos[CAMPOS]) {
     char *fin = strchr(linea, '\n');
     if (!fin || fin[1] != '\0') {
         return 0;
     }
     *fin = '\0';
     size_t cantidad = 0;
-    while (cantidad < 6 && *linea && *linea != ' ') {
+    while (cantidad < CAMPOS && *linea && *linea != ' ') {
         campos[cantidad++] = linea;
         char *espacio = strchr(linea, ' ');
         if (!espacio) {
@@ -183,7 +191,7 @@ static bool solicitar(Trabajador *hilo, const ConfigTienda *destino,
 
 static bool consultar_posicion(Trabajador *hilo, const ConfigTienda *par, size_t indice,
                                const ConfigTienda **integrante) {
-    char linea[RED_MAX_LINEA + 1], respuesta[RED_MAX_LINEA + 1], *campos[6];
+    char linea[RED_MAX_LINEA + 1], respuesta[RED_MAX_LINEA + 1], *campos[CAMPOS];
     const Configuracion *config = hilo->red.config;
     snprintf(linea, sizeof linea, "ORDEN %s %zu\n",
              config->cadenas[par->cadena].id, indice);
@@ -282,6 +290,12 @@ static void *emitir(void *contexto) {
     while (transferir(hilo->lectura, &trabajo, false)) {
         if (trabajo.inicio) {
             trabajo.exito = incorporarse(hilo, &trabajo);
+        } else if (trabajo.buscar) {
+            trabajo.exito = recuperacion_buscar(hilo->red.config, hilo->red.tienda,
+                                                &trabajo.cambio, hilo->lectura);
+        } else if (trabajo.cambio.tipo) {
+            trabajo.exito = recuperacion_acordar(hilo->red.config, hilo->red.tienda,
+                                                 &trabajo.cambio, hilo->lectura);
         } else {
             char respuesta[RED_MAX_LINEA + 1];
             const ConfigTienda *par = &hilo->red.config->tiendas[trabajo.destino];
@@ -307,6 +321,65 @@ static void anunciar_lista(const Cadena *cadena) {
 
 // Registro y aplicación de ventas
 
+static bool anexar(Cadena *cadena, const char *linea) {
+    if (cadena->historial_dudoso) {
+        return false;
+    }
+    size_t largo = strlen(linea);
+    size_t usados = 0;
+    while (usados < largo) {
+        ssize_t n = write(cadena->historial, linea + usados, largo - usados);
+        if (n > 0) {
+            usados += (size_t)n;
+        } else if (n == 0 || errno != EINTR) {
+            // Si falla la escritura, el archivo puede quedar con una línea incompleta.
+            cadena->historial_dudoso = true;
+            return false;
+        }
+    }
+    return true;
+}
+
+static bool reservar(Cadena *cadena) {
+    if (cadena->usadas == cadena->capacidad) {
+        if (cadena->capacidad > SIZE_MAX / 2 / sizeof *cadena->ventas) {
+            return false;
+        }
+        size_t nueva = cadena->capacidad ? cadena->capacidad * 2 : 32;
+        Venta *ventas = realloc(cadena->ventas, nueva * sizeof *ventas);
+        if (!ventas) {
+            return false;
+        }
+        cadena->ventas = ventas;
+        cadena->capacidad = nueva;
+    }
+    return true;
+}
+
+static void incorporar_venta(Cadena *cadena, Venta venta) {
+    cadena->ventas[cadena->usadas++] = venta;
+    cadena->total += venta.importe;
+    if (venta.origen == cadena->propia) {
+        cadena->secuencia = venta.secuencia;
+        cadena->ingreso_propio += venta.importe;
+    }
+}
+
+static Venta *venta_por_id(Cadena *cadena, size_t origen, int64_t secuencia) {
+    for (size_t i = 0; i < cadena->usadas; ++i) {
+        if (cadena->ventas[i].origen == origen && cadena->ventas[i].secuencia == secuencia) {
+            return &cadena->ventas[i];
+        }
+    }
+    return NULL;
+}
+
+static size_t tienda_de(const Cadena *cadena, const char *id) {
+    const ConfigTienda *tienda = configuracion_buscar(cadena->config, id);
+    return tienda && tienda->cadena == cadena->tienda->cadena
+               ? (size_t)(tienda - cadena->config->tiendas) : CONFIG_MAX_TIENDAS;
+}
+
 /*
  * Anexa una venta validada y actualiza los totales después de escribir la línea
  * completa. Devuelve NULL si la aplica o un mensaje de error si falla.
@@ -318,42 +391,18 @@ static const char *registrar(Cadena *cadena, Venta venta) {
     if (venta.importe > INT64_MAX - cadena->total) {
         return "DESBORDAMIENTO\n";
     }
-    if (cadena->usadas == cadena->capacidad) {
-        if (cadena->capacidad > SIZE_MAX / 2 / sizeof venta) {
-            return "SIN_ESPACIO\n";
-        }
-        size_t nueva = cadena->capacidad ? cadena->capacidad * 2 : 32;
-        Venta *ventas = realloc(cadena->ventas, nueva * sizeof venta);
-        if (!ventas) {
-            return "SIN_ESPACIO\n";
-        }
-        cadena->ventas = ventas;
-        cadena->capacidad = nueva;
+    if (!reservar(cadena)) {
+        return "SIN_ESPACIO\n";
     }
     const char *origen = cadena->config->tiendas[venta.origen].id;
-    char linea[RED_MAX_LINEA + 1];
-    int largo = snprintf(linea, sizeof linea, "APLICADA %s %s %" PRId64 " %" PRId64 "\n",
-                         cadena->id_cadena, origen, venta.secuencia, venta.importe);
-    if (largo < 0 || largo > RED_MAX_LINEA) {
+    char linea[MAX_REGISTRO];
+    int largo = snprintf(linea, sizeof linea, "APLICADA %s %s %" PRId64 " %" PRId64 "%s%s\n",
+                         cadena->id_cadena, origen, venta.secuencia, venta.importe,
+                         *venta.clave ? " " : "", venta.clave);
+    if (largo < 0 || (size_t)largo >= sizeof linea || !anexar(cadena, linea)) {
         return "ERROR_HISTORIAL\n";
     }
-    size_t usados = 0;
-    while (usados < (size_t)largo) {
-        ssize_t n = write(cadena->historial, linea + usados, (size_t)largo - usados);
-        if (n > 0) {
-            usados += (size_t)n;
-        } else if (n == 0 || errno != EINTR) {
-            // Si falla la escritura, el archivo puede quedar con una línea incompleta.
-            cadena->historial_dudoso = true;
-            return "ERROR_HISTORIAL\n";
-        }
-    }
-    cadena->ventas[cadena->usadas++] = venta;
-    cadena->total += venta.importe;
-    if (venta.origen == cadena->propia) {
-        cadena->secuencia = venta.secuencia;
-        cadena->ingreso_propio += venta.importe;
-    }
+    incorporar_venta(cadena, venta);
     printf("APLICADA %s %s %" PRId64 " %" PRId64 " propio=%" PRId64 " total=%" PRId64 "\n",
            cadena->tienda->id, origen, venta.secuencia, venta.importe,
            cadena->ingreso_propio, cadena->total);
@@ -365,7 +414,7 @@ static bool clave_valida(const char *clave) {
     return strlen(clave) <= CONFIG_MAX_ID && clave[strspn(clave, permitidos)] == '\0';
 }
 
-static void compra(Cadena *cadena, char *campos[6], char *respuesta) {
+static void compra(Cadena *cadena, char *campos[CAMPOS], char *respuesta) {
     int64_t importe;
     if (!clave_valida(campos[1]) || !numero(campos[2], &importe) || importe == 0) {
         strcpy(respuesta, "ERROR\n");
@@ -388,15 +437,14 @@ static void compra(Cadena *cadena, char *campos[6], char *respuesta) {
         return;
     }
     Venta venta = {.origen = cadena->propia, .secuencia = cadena->secuencia + 1,
-                   .importe = importe, .turno = cadena->orden[0] == cadena->propia ? 1 : 0,
-                   .confirmada_en = posicion(cadena, cadena->propia)};
+                   .importe = importe};
     strcpy(venta.clave, campos[1]);
     const char *error = registrar(cadena, venta);
     if (error) {
         strcpy(respuesta, error);
     } else {
         snprintf(respuesta, RED_MAX_LINEA + 1, "ADMITIDA %" PRId64 "\n", venta.secuencia);
-        if (venta.turno == cadena->cantidad) {
+        if (cadena->cantidad == 1) {
             printf("DIFUNDIDA %s %" PRId64 "\n", cadena->tienda->id, venta.secuencia);
         }
     }
@@ -413,10 +461,29 @@ static size_t predecesora(size_t turno, size_t origen) {
     return turno - (turno - 1 == origen ? 2 : 1);
 }
 
-static void confirmacion(char *texto, const Cadena *cadena, const Venta *venta, size_t turno) {
-    snprintf(texto, RED_MAX_LINEA + 1, "APLICADA %s %s %" PRId64 " %" PRId64 " %zu\n",
-             cadena->id_cadena, cadena->config->tiendas[venta->origen].id,
-             venta->secuencia, venta->importe, turno);
+static void confirmacion(char *texto, const Cadena *cadena, const Venta *venta, size_t turno,
+                         uint32_t version) {
+    const char *id = cadena->config->tiendas[venta->origen].id;
+    if (version == 1) {
+        snprintf(texto, RED_MAX_LINEA + 1, "APLICADA %s %s %" PRId64 " %" PRId64 " %zu\n",
+                 cadena->id_cadena, id, venta->secuencia, venta->importe, turno);
+    } else {
+        snprintf(texto, RED_MAX_LINEA + 1, "HECHA %s %s %" PRId64 " %" PRId64 " %zu %" PRIu32 "\n",
+                 cadena->id_cadena, id, venta->secuencia, venta->importe, turno, version);
+    }
+}
+
+static size_t lugar_en(const unsigned char *orden, size_t cantidad, size_t tienda) {
+    for (size_t i = 0; i < cantidad; ++i) {
+        if (orden[i] == tienda) {
+            return i;
+        }
+    }
+    return cantidad;
+}
+
+static uint64_t marcados(size_t cantidad) {
+    return cantidad == 64 ? UINT64_MAX : (UINT64_C(1) << cantidad) - 1;
 }
 
 /*
@@ -424,57 +491,269 @@ static void confirmacion(char *texto, const Cadena *cadena, const Venta *venta, 
  * Si ya se aplicó el mismo ID e importe, confirma sin volver a registrar ni sumar.
  * Si cambia el importe para ese ID, responde CONFLICTO.
  */
-static void aplicar_remota(Cadena *cadena, char *campos[6], char *respuesta) {
-    const ConfigTienda *origen = configuracion_buscar(cadena->config, campos[2]);
-    Venta venta = {.turno = cadena->cantidad};
-    int64_t anterior = siguiente(campos[5], cadena->cantidad - 1);
-    if (!origen || origen == cadena->tienda || origen->cadena != cadena->tienda->cadena ||
+static void aplicar_remota(Cadena *cadena, char *campos[CAMPOS], char *respuesta,
+                           const unsigned char *orden, size_t cantidad, uint32_t version) {
+    Venta venta = {.origen = tienda_de(cadena, campos[2])};
+    int64_t anterior = siguiente(campos[5], cantidad);
+    if (venta.origen == CONFIG_MAX_TIENDAS || venta.origen == cadena->propia ||
         !numero(campos[3], &venta.secuencia) || venta.secuencia == 0 ||
         !numero(campos[4], &venta.importe) || venta.importe == 0) {
         strcpy(respuesta, "ERROR\n");
         return;
     }
-    venta.origen = (size_t)(origen - cadena->config->tiendas);
-    size_t turno = posicion(cadena, cadena->propia);
-    if (anterior != (int64_t)predecesora(turno, posicion(cadena, venta.origen))) {
+    size_t turno = lugar_en(orden, cantidad, cadena->propia);
+    size_t origen = lugar_en(orden, cantidad, venta.origen);
+    if (turno == cantidad || anterior != (int64_t)predecesora(turno, origen)) {
         strcpy(respuesta, "FUERA_DE_TURNO\n");
         return;
     }
-    for (size_t i = 0; i < cadena->usadas; ++i) {
-        const Venta *anterior_venta = &cadena->ventas[i];
-        if (anterior_venta->origen == venta.origen && anterior_venta->secuencia == venta.secuencia) {
-            if (anterior_venta->importe == venta.importe) {
-                confirmacion(respuesta, cadena, &venta, turno);
-            } else {
-                strcpy(respuesta, "CONFLICTO\n");
-            }
-            return;
+    const Venta *anterior_venta = venta_por_id(cadena, venta.origen, venta.secuencia);
+    if (anterior_venta) {
+        if (anterior_venta->importe == venta.importe) {
+            confirmacion(respuesta, cadena, &venta, turno, version);
+        } else {
+            strcpy(respuesta, "CONFLICTO\n");
         }
+        return;
     }
     const char *error = registrar(cadena, venta);
     if (error) {
         strcpy(respuesta, error);
     } else {
-        confirmacion(respuesta, cadena, &venta, turno);
+        confirmacion(respuesta, cadena, &venta, turno, version);
     }
 }
 
+// Cambios de participantes
+
+static bool instalar(Cadena *cadena, const CambioLista *cambio) {
+    char linea[MAX_REGISTRO];
+    int usados = snprintf(linea, sizeof linea, "VISTA %" PRIu32, cambio->version);
+    for (size_t i = 0; i < cambio->cantidad; ++i) {
+        usados += snprintf(linea + usados, sizeof linea - (size_t)usados,
+                           " %s", cadena->config->tiendas[cambio->orden[i]].id);
+    }
+    snprintf(linea + usados, sizeof linea - (size_t)usados, "\n");
+    if (!anexar(cadena, linea)) {
+        return false;
+    }
+    cadena->version = cambio->version;
+    cadena->cantidad = cambio->cantidad;
+    memcpy(cadena->orden, cambio->orden, cambio->cantidad);
+    cadena->lista = true;
+    cadena->reiniciada = false;
+    for (size_t i = 0; i < cadena->usadas; ++i) {
+        cadena->ventas[i].reintentar = 0;
+    }
+    anunciar_lista(cadena);
+    printf("VISTA %s %" PRIu32 "\n", cadena->tienda->id, cadena->version);
+    return true;
+}
+
+static bool formar_cambio(const Cadena *cadena, CambioLista *cambio, char tipo, size_t objetivo) {
+    if (cadena->version == 0 || cadena->version == UINT32_MAX ||
+        cadena->ultima_propuesta == UINT32_MAX ||
+        objetivo >= CONFIG_MAX_TIENDAS) {
+        return false;
+    }
+    bool presente = posicion(cadena, objetivo) < cadena->cantidad;
+    if (presente == (tipo == 'R')) {
+        return false;
+    }
+    uint32_t ultima = cadena->ultima_propuesta > cadena->version ? cadena->ultima_propuesta : cadena->version;
+    *cambio = (CambioLista){.version = ultima + 1, .base = cadena->version,
+                           .tipo = tipo, .objetivo = objetivo};
+    for (size_t i = 0; i < cadena->cantidad; ++i) {
+        if (tipo != 'B' || cadena->orden[i] != objetivo) {
+            cambio->orden[cambio->cantidad++] = cadena->orden[i];
+        }
+    }
+    if (tipo == 'R' && cambio->cantidad < CONFIG_MAX_TIENDAS) {
+        cambio->orden[cambio->cantidad++] = (unsigned char)objetivo;
+    }
+    return cambio->cantidad > 0 &&
+           (tipo != 'R' || cambio->orden[cambio->cantidad - 1] == objetivo);
+}
+
+static bool preparar_cambio(Cadena *cadena, uint32_t version, uint32_t base, char tipo,
+                            size_t objetivo, size_t cantidad) {
+    if (cantidad == 0 || cantidad > cadena->cantidad_configurada || version <= base ||
+        base < cadena->version ||
+        objetivo >= CONFIG_MAX_TIENDAS) {
+        return false;
+    }
+    if (cadena->cambio.version) {
+        return cadena->cambio.version == version && cadena->cambio.tipo == tipo &&
+               cadena->cambio.base == base && cadena->cambio.objetivo == objetivo &&
+               cadena->cambio.cantidad == cantidad;
+    }
+    if (version <= cadena->ultima_propuesta) {
+        return false;
+    }
+    CambioLista propuesta;
+    if (tipo == 'R' && objetivo == cadena->propia && cadena->reiniciada) {
+        propuesta = (CambioLista){.version = version, .tipo = tipo,
+                                   .objetivo = objetivo, .cantidad = cantidad};
+        memset(propuesta.orden, UCHAR_MAX, sizeof propuesta.orden);
+        propuesta.orden[cantidad - 1] = (unsigned char)objetivo;
+    } else if (!formar_cambio(cadena, &propuesta, tipo, objetivo) || propuesta.base != base ||
+               propuesta.cantidad != cantidad ||
+               lugar_en(propuesta.orden, cantidad, cadena->propia) == cantidad) {
+        return false;
+    }
+    propuesta.version = version;
+    propuesta.base = base;
+    char linea[RED_MAX_LINEA];
+    snprintf(linea, sizeof linea, "PREPARA %" PRIu32 " %c %s %" PRIu32 "\n",
+             version, tipo, cadena->config->tiendas[objetivo].id, base);
+    if (!anexar(cadena, linea)) {
+        return false;
+    }
+    cadena->cambio = propuesta;
+    cadena->ultima_propuesta = version;
+    cadena->verificados = 0;
+    return true;
+}
+
+// El aviso de baja inicia un acuerdo. La lista cambia solo al instalarlo.
+static bool atender_cambio(Cadena *cadena, char *campos[CAMPOS], size_t campos_usados,
+                           char *respuesta) {
+    const char *orden = campos[0];
+    if (campos_usados == 3 && strcmp(orden, "VIGENTE") == 0 && cadena->version) {
+        size_t par = tienda_de(cadena, campos[2]);
+        if (par < CONFIG_MAX_TIENDAS) {
+            snprintf(respuesta, RED_MAX_LINEA + 1, "VIGENTE %" PRIu32 " %s %d %d\n",
+                     cadena->version, cadena->config->tiendas[cadena->orden[0]].id,
+                     posicion(cadena, par) < cadena->cantidad, cadena->lista && !cadena->cambio.version);
+        }
+        return true;
+    }
+    if (campos_usados == 3 && (strcmp(orden, "BAJA_ENSAYO") == 0 ||
+                               strcmp(orden, "RETORNO") == 0 || strcmp(orden, "REANUDAR") == 0)) {
+        char tipo = strcmp(orden, "BAJA_ENSAYO") == 0 ? 'B' : strcmp(orden, "RETORNO") == 0 ? 'R' : 'I';
+        size_t par = tienda_de(cadena, campos[2]);
+        CambioLista propuesta;
+        if (cadena->lista && !cadena->cambio.version && !cadena->control_en_curso &&
+            !cadena->encargo.tipo && par != cadena->propia &&
+            (tipo != 'B' || strncmp(cadena->tienda->direccion, "127.", 4) == 0) &&
+            formar_cambio(cadena, &propuesta, tipo, par) && propuesta.orden[0] == cadena->propia) {
+            cadena->encargo = propuesta;
+            strcpy(respuesta, "CAMBIO_SOLICITADO\n");
+        } else {
+            strcpy(respuesta, "CAMBIO_NO_DISPONIBLE\n");
+        }
+        return true;
+    }
+    CambioLista *cambio = &cadena->cambio;
+    int64_t version = siguiente(campos[2], UINT32_MAX);
+    if (campos_usados == 7 && strcmp(orden, "PREPARAR") == 0 && version > 0 &&
+        strlen(campos[3]) == 1 && strchr("BRI", campos[3][0])) {
+        int64_t cantidad = siguiente(campos[5], CONFIG_MAX_TIENDAS);
+        int64_t base = siguiente(campos[6], UINT32_MAX);
+        if (cantidad > 0 && base > 0 && preparar_cambio(cadena, (uint32_t)version,
+                                           (uint32_t)base, campos[3][0],
+                                           tienda_de(cadena, campos[4]), (size_t)cantidad)) {
+            strcpy(respuesta, "PREPARADA\n");
+        }
+        return true;
+    }
+    if (campos_usados == 3 && strcmp(orden, "INSTALAR") == 0 &&
+        version > 0 && version == cadena->version && cadena->lista) {
+        strcpy(respuesta, "INSTALADA\n");
+        return true;
+    }
+    if (campos_usados == 3 && strcmp(orden, "CANCELAR") == 0 &&
+        version > cadena->version && (!cambio->version || cambio->version == version)) {
+        if (!cambio->version && version <= cadena->ultima_propuesta) {
+            strcpy(respuesta, "CANCELADA\n");
+            return true;
+        }
+        char linea[64];
+        snprintf(linea, sizeof linea, "CANCELA %" PRId64 "\n", version);
+        if (anexar(cadena, linea)) {
+            cambio->version = 0;
+            cadena->ultima_propuesta = (uint32_t)version;
+            printf("CAMBIO_CANCELADO %s\n", cadena->tienda->id);
+            strcpy(respuesta, "CANCELADA\n");
+        }
+        return true;
+    }
+    if (version <= 0 || version != cambio->version) {
+        return false;
+    }
+    if (campos_usados == 5 && strcmp(orden, "MIEMBRO") == 0) {
+        int64_t indice = siguiente(campos[3], cambio->cantidad - 1);
+        size_t par = tienda_de(cadena, campos[4]);
+        if (indice >= 0 && par < CONFIG_MAX_TIENDAS &&
+            (cambio->orden[indice] == UCHAR_MAX || cambio->orden[indice] == par)) {
+            size_t anterior = lugar_en(cambio->orden, cambio->cantidad, par);
+            if (anterior == cambio->cantidad || anterior == (size_t)indice) {
+                cambio->orden[indice] = (unsigned char)par;
+                cadena->verificados |= UINT64_C(1) << indice;
+                strcpy(respuesta, "VERIFICADO\n");
+            }
+        }
+        return true;
+    }
+    if (campos_usados == 3 && strcmp(orden, "INSTALAR") == 0 &&
+        cadena->verificados == marcados(cambio->cantidad) && instalar(cadena, cambio)) {
+        cambio->version = 0;
+        strcpy(respuesta, "INSTALADA\n");
+        return true;
+    }
+    return false;
+}
+
 static void atender(Cadena *cadena, char *linea, char *respuesta) {
-    char *campos[6];
+    char *campos[CAMPOS];
     size_t cantidad = separar(linea, campos);
     strcpy(respuesta, "ERROR\n");
     if (cantidad == 3 && strcmp(campos[0], "COMPRA") == 0) {
-        if (cadena->lista) {
+        if (cadena->lista && !cadena->cambio.version) {
             compra(cadena, campos, respuesta);
         } else {
-            strcpy(respuesta, "ORDEN_NO_LISTO\n");
+            strcpy(respuesta, cadena->cambio.version ? "CAMBIO_EN_CURSO\n" : "ORDEN_NO_LISTO\n");
         }
         return;
     }
     if (cantidad < 3 || strcmp(campos[1], cadena->id_cadena) != 0) {
         return;
     }
-    if (cantidad == 3 && strcmp(campos[0], "ORDEN") == 0) {
+    if (atender_cambio(cadena, campos, cantidad, respuesta)) {
+        return;
+    }
+    if (cantidad == 4 && strcmp(campos[0], "FICHA") == 0 && cadena->cambio.version &&
+        siguiente(campos[3], UINT32_MAX) == cadena->cambio.version) {
+        int64_t indice = siguiente(campos[2], cadena->usadas);
+        if (indice >= 0 && (size_t)indice == cadena->usadas) {
+            strcpy(respuesta, "FIN\n");
+        } else if (indice >= 0) {
+            const Venta *venta = &cadena->ventas[indice];
+            snprintf(respuesta, RED_MAX_LINEA + 1, "FICHA %s %" PRId64 " %" PRId64 "\n",
+                     cadena->config->tiendas[venta->origen].id, venta->secuencia, venta->importe);
+        }
+    } else if (cantidad == 5 && strcmp(campos[0], "TIENE") == 0 && cadena->cambio.version &&
+               siguiente(campos[4], UINT32_MAX) == cadena->cambio.version) {
+        size_t origen = tienda_de(cadena, campos[2]);
+        int64_t secuencia;
+        if (origen < CONFIG_MAX_TIENDAS && numero(campos[3], &secuencia) && secuencia > 0) {
+            const Venta *venta = venta_por_id(cadena, origen, secuencia);
+            if (venta) {
+                snprintf(respuesta, RED_MAX_LINEA + 1, "CONOCE %" PRId64 "\n", venta->importe);
+            } else {
+                strcpy(respuesta, "FALTA\n");
+            }
+        }
+    } else if (cantidad == 7 && strcmp(campos[0], "RECUP") == 0) {
+        if (cadena->cambio.version && cadena->cambio.tipo != 'B' &&
+            siguiente(campos[6], UINT32_MAX) == cadena->cambio.version &&
+            cadena->verificados == marcados(cadena->cambio.cantidad)) {
+            aplicar_remota(cadena, campos, respuesta, cadena->cambio.orden,
+                           cadena->cambio.cantidad, cadena->cambio.version);
+        } else {
+            strcpy(respuesta, "VISTA_INCORRECTA\n");
+        }
+    } else if (cantidad == 3 && strcmp(campos[0], "ORDEN") == 0) {
         int64_t indice = siguiente(campos[2], cadena->cantidad);
         if (indice >= 0 && !cadena->incorporando) {
             if ((size_t)indice == cadena->cantidad) {
@@ -486,6 +765,9 @@ static void atender(Cadena *cadena, char *linea, char *respuesta) {
         }
     } else if (cantidad == 4 && (strcmp(campos[0], "ALTA") == 0 ||
                                 strcmp(campos[0], "SELLAR") == 0)) {
+        if (cadena->version) {
+            return;
+        }
         const ConfigTienda *nueva = configuracion_buscar(cadena->config, campos[2]);
         int64_t indice = siguiente(campos[3], cadena->cantidad_configurada);
         if (cadena->incorporando || !nueva || nueva->cadena != cadena->tienda->cadena || indice < 0) {
@@ -502,15 +784,19 @@ static void atender(Cadena *cadena, char *linea, char *respuesta) {
         } else if ((size_t)indice == cadena->cantidad_configurada &&
                    cadena->cantidad == cadena->cantidad_configurada &&
                    lugar == cadena->cantidad - 1) {
-            if (!cadena->lista) {
-                cadena->lista = true;
-                anunciar_lista(cadena);
+            CambioLista inicial = {.version = 1, .cantidad = cadena->cantidad};
+            memcpy(inicial.orden, cadena->orden, cadena->cantidad);
+            if (instalar(cadena, &inicial)) {
+                strcpy(respuesta, "LISTA_OK\n");
             }
-            strcpy(respuesta, "LISTA_OK\n");
         }
-    } else if (cantidad == 6 && strcmp(campos[0], "VENTA") == 0) {
-        if (cadena->lista) {
-            aplicar_remota(cadena, campos, respuesta);
+    } else if ((cantidad == 6 && strcmp(campos[0], "VENTA") == 0) ||
+               (cantidad == 7 && strcmp(campos[0], "VENTA2") == 0)) {
+        int64_t version = cantidad == 6 ? 1 : siguiente(campos[6], UINT32_MAX);
+        if (version != cadena->version || cadena->cambio.version) {
+            strcpy(respuesta, "VISTA_INCORRECTA\n");
+        } else if (cadena->lista) {
+            aplicar_remota(cadena, campos, respuesta, cadena->orden, cadena->cantidad, cadena->version);
         } else {
             strcpy(respuesta, "ORDEN_NO_LISTO\n");
         }
@@ -530,30 +816,70 @@ static void terminar_envio(Cadena *cadena, const Mensaje *resultado) {
         memcpy(cadena->orden, resultado->orden, cadena->cantidad);
         printf("INCORPORADA %s\n", cadena->tienda->id);
         if (cadena->cantidad == cadena->cantidad_configurada) {
-            cadena->lista = true;
-            anunciar_lista(cadena);
+            CambioLista inicial = {.version = 1, .cantidad = cadena->cantidad};
+            memcpy(inicial.orden, cadena->orden, cadena->cantidad);
+            if (!instalar(cadena, &inicial)) {
+                fprintf(stderr, "No se guardó la lista inicial\n");
+            }
+        }
+        return;
+    }
+    if (resultado->buscar || resultado->cambio.tipo) {
+        cadena->control_en_curso = false;
+        cadena->buscar_desde = red_reloj_ms() + REINTENTO_MS;
+        if (!resultado->buscar && !resultado->exito) {
+            printf("CAMBIO_PENDIENTE %s\n", cadena->tienda->id);
         }
         return;
     }
     Venta *venta = &cadena->ventas[cadena->en_envio];
+    cadena->en_envio = SIZE_MAX;
+    if (resultado->cambio.version != cadena->version || cadena->cambio.version) {
+        return;
+    }
+    const char *id_destino = cadena->config->tiendas[resultado->destino].id;
     if (resultado->exito) {
-        venta->confirmada_en = venta->turno;
-        ++venta->turno;
-        if (venta->turno < cadena->cantidad && cadena->orden[venta->turno] == cadena->propia) {
-            ++venta->turno;
+        char registro[RED_MAX_LINEA + 1];
+        snprintf(registro, sizeof registro, "CONFIRMADA %" PRIu32 " %s %" PRId64 " %s\n",
+                 cadena->version, cadena->config->tiendas[venta->origen].id,
+                 venta->secuencia, id_destino);
+        if (!anexar(cadena, registro)) {
+            return;
         }
+        venta->confirmadas |= UINT64_C(1) << resultado->destino;
         venta->reintentar = 0;
-        if (venta->turno == cadena->cantidad) {
+        bool difundida = true;
+        for (size_t i = 0; i < cadena->cantidad; ++i) {
+            size_t par = cadena->orden[i];
+            if (par != cadena->propia && par != venta->origen &&
+                !(venta->confirmadas & (UINT64_C(1) << par))) {
+                difundida = false;
+            }
+        }
+        if (difundida && venta->origen == cadena->propia) {
             printf("DIFUNDIDA %s %" PRId64 "\n", cadena->tienda->id, venta->secuencia);
         }
     } else {
         if (venta->reintentar == 0) {
-            printf("PENDIENTE %s %" PRId64 " %s\n", cadena->tienda->id, venta->secuencia,
-                   cadena->config->tiendas[cadena->orden[venta->turno]].id);
+            printf("PENDIENTE %s %" PRId64 " %s\n", cadena->tienda->id, venta->secuencia, id_destino);
         }
         venta->reintentar = red_reloj_ms() + REINTENTO_MS;
     }
-    cadena->en_envio = SIZE_MAX;
+}
+
+static size_t turno_pendiente(const Cadena *cadena, const Venta *venta, size_t *previa) {
+    *previa = posicion(cadena, venta->origen);
+    for (size_t i = 0; i < cadena->cantidad; ++i) {
+        size_t par = cadena->orden[i];
+        if (par == venta->origen) {
+            continue;
+        }
+        if (par != cadena->propia && !(venta->confirmadas & (UINT64_C(1) << par))) {
+            return i;
+        }
+        *previa = i;
+    }
+    return cadena->cantidad;
 }
 
 /*
@@ -562,7 +888,8 @@ static void terminar_envio(Cadena *cadena, const Mensaje *resultado) {
  * esperar un evento o -2 si falla el reloj.
  */
 static int programar(Cadena *cadena, Canal *emisor) {
-    if (!cadena->lista || cadena->en_envio != SIZE_MAX || emisor->enviar) {
+    if (cadena->historial_dudoso || cadena->cambio.version || cadena->control_en_curso ||
+        cadena->en_envio != SIZE_MAX || emisor->enviar) {
         return -1;
     }
     int espera = -1;
@@ -570,10 +897,35 @@ static int programar(Cadena *cadena, Canal *emisor) {
     if (ahora < 0) {
         return -2;
     }
+    if (cadena->encargo.tipo) {
+        emisor->salida = (Mensaje){.cambio = cadena->encargo};
+        cadena->encargo.tipo = 0;
+        cadena->control_en_curso = emisor->enviar = true;
+        return -1;
+    }
+    if (cadena->reiniciada) {
+        if (cadena->buscar_desde > ahora) {
+            return (int)(cadena->buscar_desde - ahora);
+        }
+        emisor->salida = (Mensaje){.buscar = true, .cambio = {.version = cadena->version,
+                                                             .base = cadena->ultima_propuesta,
+                                                             .cantidad = cadena->cantidad}};
+        memcpy(emisor->salida.cambio.orden, cadena->orden, cadena->cantidad);
+        cadena->control_en_curso = emisor->enviar = true;
+        return -1;
+    }
+    if (!cadena->lista) {
+        return -1;
+    }
     for (size_t i = 0; i < cadena->usadas; ++i) {
         size_t indice = (cadena->proxima + i) % cadena->usadas;
         Venta *venta = &cadena->ventas[indice];
-        if (venta->origen != cadena->propia || venta->turno == cadena->cantidad) {
+        if (venta->origen != cadena->propia && posicion(cadena, venta->origen) < cadena->cantidad) {
+            continue;
+        }
+        size_t previa;
+        size_t turno = turno_pendiente(cadena, venta, &previa);
+        if (turno == cadena->cantidad) {
             continue;
         }
         if (venta->reintentar > ahora) {
@@ -583,12 +935,17 @@ static int programar(Cadena *cadena, Canal *emisor) {
             }
             continue;
         }
-        Mensaje salida = {.destino = cadena->orden[venta->turno]};
-        // El primer recibo es el registro propio. Los siguientes provienen del ACK cotejado.
-        snprintf(salida.linea, sizeof salida.linea, "VENTA %s %s %" PRId64 " %" PRId64 " %zu\n",
-                 cadena->id_cadena, cadena->tienda->id, venta->secuencia, venta->importe,
-                 venta->confirmada_en);
-        confirmacion(salida.confirmacion, cadena, venta, venta->turno);
+        Mensaje salida = {.destino = cadena->orden[turno], .cambio = {.version = cadena->version}};
+        const char *origen = cadena->config->tiendas[venta->origen].id;
+        if (cadena->version == 1) {
+            snprintf(salida.linea, sizeof salida.linea, "VENTA %s %s %" PRId64 " %" PRId64 " %zu\n",
+                     cadena->id_cadena, origen, venta->secuencia, venta->importe, previa);
+        } else {
+            snprintf(salida.linea, sizeof salida.linea,
+                     "VENTA2 %s %s %" PRId64 " %" PRId64 " %zu %" PRIu32 "\n",
+                     cadena->id_cadena, origen, venta->secuencia, venta->importe, previa, cadena->version);
+        }
+        confirmacion(salida.confirmacion, cadena, venta, turno, cadena->version);
         emisor->salida = salida;
         emisor->enviar = true;
         cadena->en_envio = indice;
@@ -695,20 +1052,174 @@ static bool atender_canales(Cadena *cadena, Canal canales[TRABAJADORES], int fin
 
 // Arranque y terminación
 
-/*
- * Abre o crea un historial regular vacío para iniciar el contador. Devuelve
- * el descriptor o -1 si no se puede usar. Conserva los archivos con datos.
- */
-static int abrir_historial(const char *ruta) {
-    int fd = open(ruta, O_WRONLY | O_CREAT | O_APPEND | O_NONBLOCK, 0600);
+static bool leer_venta(Cadena *cadena, char *campos[CAMPOS], size_t cantidad) {
+    if (cantidad < 5 || cantidad > 6 || !cadena->version ||
+        strcmp(campos[1], cadena->id_cadena) != 0) {
+        return false;
+    }
+    Venta venta = {.origen = tienda_de(cadena, campos[2])};
+    if (venta.origen == CONFIG_MAX_TIENDAS ||
+        !numero(campos[3], &venta.secuencia) || venta.secuencia <= 0 ||
+        !numero(campos[4], &venta.importe) || venta.importe <= 0 ||
+        venta.importe > INT64_MAX - cadena->total || venta_por_id(cadena, venta.origen, venta.secuencia)) {
+        return false;
+    }
+    if (venta.origen == cadena->propia) {
+        if (cantidad != 6 || !clave_valida(campos[5]) || cadena->secuencia == INT64_MAX ||
+            venta.secuencia != cadena->secuencia + 1) {
+            return false;
+        }
+        for (size_t i = 0; i < cadena->usadas; ++i) {
+            if (cadena->ventas[i].origen == cadena->propia &&
+                strcmp(cadena->ventas[i].clave, campos[5]) == 0) {
+                return false;
+            }
+        }
+        strcpy(venta.clave, campos[5]);
+    } else if (cantidad != 5) {
+        return false;
+    }
+    if (!reservar(cadena)) {
+        return false;
+    }
+    incorporar_venta(cadena, venta);
+    return true;
+}
+
+static bool leer_registro(Cadena *cadena, char *linea, uint32_t *preparada) {
+    char *campos[CAMPOS];
+    size_t cantidad = separar(linea, campos);
+    if (!cantidad) {
+        return false;
+    }
+    if (strcmp(campos[0], "APLICADA") == 0) {
+        return leer_venta(cadena, campos, cantidad);
+    }
+    int64_t version = cantidad > 1 ? siguiente(campos[1], UINT32_MAX) : -1;
+    if (version <= 0) {
+        return false;
+    }
+    if (cantidad == 5 && strcmp(campos[0], "PREPARA") == 0 && cadena->version &&
+        version > cadena->version && version > cadena->ultima_propuesta && !*preparada &&
+        siguiente(campos[4], UINT32_MAX) >= cadena->version &&
+        siguiente(campos[4], UINT32_MAX) < version && strlen(campos[2]) == 1 &&
+        strchr("BRI", campos[2][0]) && tienda_de(cadena, campos[3]) < CONFIG_MAX_TIENDAS) {
+        *preparada = (uint32_t)version;
+        cadena->ultima_propuesta = (uint32_t)version;
+        return true;
+    }
+    if (cantidad == 2 && strcmp(campos[0], "CANCELA") == 0 &&
+        (version == *preparada ||
+         (!*preparada && version > cadena->version && version > cadena->ultima_propuesta))) {
+        *preparada = 0;
+        cadena->ultima_propuesta = (uint32_t)version;
+        return true;
+    }
+    if (cantidad >= 3 && strcmp(campos[0], "VISTA") == 0 && version > cadena->version &&
+        ((!cadena->version && version == 1) || version == *preparada)) {
+        uint64_t vistos = 0;
+        for (size_t i = 2; i < cantidad; ++i) {
+            size_t tienda = tienda_de(cadena, campos[i]);
+            if (tienda == CONFIG_MAX_TIENDAS || (vistos & (UINT64_C(1) << tienda))) {
+                return false;
+            }
+            vistos |= UINT64_C(1) << tienda;
+            cadena->orden[i - 2] = (unsigned char)tienda;
+        }
+        if (!(vistos & (UINT64_C(1) << cadena->propia))) {
+            return false;
+        }
+        cadena->cantidad = cantidad - 2;
+        cadena->version = (uint32_t)version;
+        *preparada = 0;
+        return true;
+    }
+    if (cantidad == 5 && strcmp(campos[0], "CONFIRMADA") == 0 && version == cadena->version &&
+        !*preparada) {
+        size_t origen = tienda_de(cadena, campos[2]), destino = tienda_de(cadena, campos[4]);
+        int64_t secuencia;
+        if (origen < CONFIG_MAX_TIENDAS && destino < CONFIG_MAX_TIENDAS && destino != origen &&
+            destino != cadena->propia && posicion(cadena, destino) < cadena->cantidad &&
+            numero(campos[3], &secuencia)) {
+            Venta *venta = venta_por_id(cadena, origen, secuencia);
+            if (venta) {
+                venta->confirmadas |= UINT64_C(1) << destino;
+                return true;
+            }
+        }
+    }
+    return false;
+}
+
+// Valida el archivo completo antes de admitir conexiones comerciales.
+static bool reconstruir(Cadena *cadena, const char *cabecera) {
+    int fd = dup(cadena->historial);
+    FILE *archivo = fd == -1 ? NULL : fdopen(fd, "r");
+    if (!archivo) {
+        if (fd != -1) {
+            close(fd);
+        }
+        perror("lectura del historial");
+        return false;
+    }
+    char linea[MAX_REGISTRO];
+    if (!fgets(linea, sizeof linea, archivo) || strcmp(linea, cabecera) != 0) {
+        fprintf(stderr, "Historial incompatible o identidad distinta. Se conserva el archivo.\n");
+        fclose(archivo);
+        return false;
+    }
+    uint32_t preparada = 0;
+    bool valido = true;
+    bool cerrada = false;
+    while (valido && fgets(linea, sizeof linea, archivo)) {
+        if (strcmp(linea, "CERRADA_META\n") == 0) {
+            cerrada = true;
+            break;
+        }
+        valido = leer_registro(cadena, linea, &preparada);
+    }
+    if (ferror(archivo)) {
+        valido = false;
+    }
+    if (fclose(archivo) != 0) {
+        valido = false;
+    }
+    if (cerrada) {
+        fprintf(stderr, "Tienda cerrada por meta. Se conserva el historial.\n");
+        return false;
+    }
+    if (!valido) {
+        fprintf(stderr, "Historial inválido o registro incompleto. Se conserva el archivo.\n");
+        return false;
+    }
+    if (preparada || !cadena->version) {
+        fprintf(stderr, "Cambio de lista inconcluso o sin vista acordada. Recuperación pendiente.\n");
+        return false;
+    }
+    cadena->reiniciada = true;
+    return true;
+}
+
+static int abrir_historial(Cadena *cadena) {
+    const char *ruta = cadena->tienda->historial;
+    int fd = open(ruta, O_RDWR | O_CREAT | O_APPEND | O_NONBLOCK, 0600);
     if (fd == -1) {
         perror(ruta);
         return -1;
     }
     struct stat datos;
-    if (fstat(fd, &datos) == -1 || !S_ISREG(datos.st_mode) || datos.st_size != 0) {
-        fprintf(stderr, "El historial de cadena debe ser un archivo regular vacío: %s\n", ruta);
+    if (fstat(fd, &datos) == -1 || !S_ISREG(datos.st_mode)) {
+        fprintf(stderr, "El historial debe ser un archivo regular: %s\n", ruta);
         close(fd);
+        return -1;
+    }
+    cadena->historial = fd;
+    char cabecera[RED_MAX_LINEA];
+    snprintf(cabecera, sizeof cabecera, "HISTORIAL5 %s %s\n", cadena->id_cadena, cadena->tienda->id);
+    bool valido = datos.st_size == 0 ? anexar(cadena, cabecera) : reconstruir(cadena, cabecera);
+    if (!valido) {
+        close(fd);
+        free(cadena->ventas);
         return -1;
     }
     return fd;
@@ -738,7 +1249,7 @@ int tienda_cadena_ejecutar(const Configuracion *config, const ConfigTienda *tien
     }
     Cadena cadena = {.config = config, .tienda = tienda, .id_cadena = config->cadenas[tienda->cadena].id,
                      .propia = (size_t)(tienda - config->tiendas), .en_envio = SIZE_MAX};
-    cadena.historial = abrir_historial(tienda->historial);
+    cadena.historial = abrir_historial(&cadena);
     if (cadena.historial == -1) {
         close(escucha);
         return EXIT_FAILURE;
@@ -784,7 +1295,10 @@ int tienda_cadena_ejecutar(const Configuracion *config, const ConfigTienda *tien
         ++iniciados;
     }
 
-    if (entrada) {
+    if (cadena.reiniciada) {
+        printf("RECUPERANDO %s propio=%" PRId64 " total=%" PRId64 "\n",
+               tienda->id, cadena.ingreso_propio, cadena.total);
+    } else if (entrada) {
         cadena.incorporando = true;
         canales[EMISOR].salida = (Mensaje){.destino = (size_t)(entrada - config->tiendas),
                                          .inicio = true};
@@ -794,8 +1308,11 @@ int tienda_cadena_ejecutar(const Configuracion *config, const ConfigTienda *tien
         cadena.cantidad = 1;
         printf("INCORPORADA %s\n", tienda->id);
         if (cadena.cantidad_configurada == 1) {
-            cadena.lista = true;
-            anunciar_lista(&cadena);
+            CambioLista inicial = {.version = 1, .cantidad = 1, .orden = {(unsigned char)cadena.propia}};
+            if (!instalar(&cadena, &inicial)) {
+                fprintf(stderr, "No se guardó la lista inicial\n");
+                goto cerrar;
+            }
         }
     }
     if (atender_canales(&cadena, canales, fin[0])) {

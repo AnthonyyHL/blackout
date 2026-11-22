@@ -44,6 +44,11 @@ static int64_t nuevo_plazo(void) {
     return ahora < 0 ? -1 : ahora + RED_PLAZO_MS;
 }
 
+static int64_t plazo_hasta(int64_t limite) {
+    int64_t plazo = nuevo_plazo();
+    return limite >= 0 && limite < plazo ? limite : plazo;
+}
+
 static bool esperar(int fd, short evento, int64_t vence) {
     if (vence < 0) {
         return false;
@@ -169,7 +174,7 @@ int red_escuchar(const ConfigTienda *tienda) {
     return fd;
 }
 
-static int conectar(const ConfigTienda *destino) {
+static int conectar(const ConfigTienda *destino, int64_t limite) {
     int fd = socket(AF_INET, SOCK_STREAM, 0);
     if (fd == -1) {
         return -1;
@@ -177,7 +182,7 @@ static int conectar(const ConfigTienda *destino) {
     if (!red_no_bloqueante(fd)) {
         return cerrar_por_error(fd);
     }
-    int64_t vence = nuevo_plazo();
+    int64_t vence = plazo_hasta(limite);
     if (vence < 0) {
         return cerrar_por_error(fd);
     }
@@ -309,22 +314,31 @@ void *red_recibir(void *contexto) {
 
 bool red_intercambiar(const ConfigTienda *destino, const char *linea, char *respuesta,
                       char *error, size_t capacidad_error) {
+    return red_intercambiar_hasta(destino, linea, respuesta, error, capacidad_error, -1);
+}
+
+bool red_intercambiar_hasta(const ConfigTienda *destino, const char *linea, char *respuesta,
+                            char *error, size_t capacidad_error, int64_t limite) {
     size_t longitud = strlen(linea);
     if (longitud == 0 || longitud > RED_MAX_LINEA || linea[longitud - 1] != '\n') {
         snprintf(error, capacidad_error, "mensaje demasiado largo");
         return false;
     }
-    int fd = conectar(destino);
+    if (limite >= 0 && red_reloj_ms() >= limite) {
+        snprintf(error, capacidad_error, "plazo agotado");
+        return false;
+    }
+    int fd = conectar(destino, limite);
     if (fd == -1) {
         snprintf(error, capacidad_error, "conexión con %s: %s", destino->id, strerror(errno));
         return false;
     }
     bool exito = false;
-    if (!escribir_linea(fd, linea, longitud, nuevo_plazo())) {
+    if (!escribir_linea(fd, linea, longitud, plazo_hasta(limite))) {
         snprintf(error, capacidad_error, "envío a %s: %s", destino->id, strerror(errno));
     } else {
         LectorRed lector = {0};
-        ResultadoLinea resultado = leer_linea(fd, &lector, respuesta, nuevo_plazo());
+        ResultadoLinea resultado = leer_linea(fd, &lector, respuesta, plazo_hasta(limite));
         if (resultado == LINEA_ERROR) {
             snprintf(error, capacidad_error, "respuesta de %s: %s", destino->id, strerror(errno));
         } else if (resultado == LINEA_COMPLETA && *respuesta) {
