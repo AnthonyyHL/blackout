@@ -13,8 +13,7 @@ enum {
     TAM_BLOQUE = 1024
 };
 
-static bool aplicar_registro(TiendaLocal *tienda, const char *registro)
-{
+static bool aplicar_registro(TiendaLocal *tienda, const char *registro) {
     if (tienda->cerrada_por_meta || registro[0] < '1' || registro[0] > '9') {
         return false;
     }
@@ -32,8 +31,7 @@ static bool aplicar_registro(TiendaLocal *tienda, const char *registro)
     return true;
 }
 
-static ResultadoTiendaLocal reconstruir_historial(TiendaLocal *tienda)
-{
+static ResultadoTiendaLocal reconstruir_historial(TiendaLocal *tienda) {
     char bloque[TAM_BLOQUE];
     char registro[TAM_REGISTRO];
     size_t usados = 0;
@@ -69,8 +67,7 @@ static ResultadoTiendaLocal reconstruir_historial(TiendaLocal *tienda)
 }
 
 ResultadoTiendaLocal tienda_local_abrir(TiendaLocal *tienda, const char *ruta,
-                                        int64_t meta)
-{
+                                        int64_t meta) {
     if (tienda == NULL || tienda->fd_historial >= 0 ||
         ruta == NULL || ruta[0] == '\0' || meta <= 0) {
         return TIENDA_PARAMETRO_INVALIDO;
@@ -104,8 +101,7 @@ ResultadoTiendaLocal tienda_local_abrir(TiendaLocal *tienda, const char *ruta,
     return TIENDA_OK;
 }
 
-ResultadoTiendaLocal tienda_local_registrar(TiendaLocal *tienda, int64_t importe)
-{
+ResultadoTiendaLocal tienda_local_registrar(TiendaLocal *tienda, int64_t importe) {
     if (tienda == NULL || tienda->fd_historial < 0) {
         return TIENDA_PARAMETRO_INVALIDO;
     }
@@ -153,8 +149,7 @@ ResultadoTiendaLocal tienda_local_registrar(TiendaLocal *tienda, int64_t importe
     return TIENDA_OK;
 }
 
-ResultadoTiendaLocal tienda_local_cerrar(TiendaLocal *tienda)
-{
+ResultadoTiendaLocal tienda_local_cerrar(TiendaLocal *tienda) {
     if (tienda == NULL || tienda->fd_historial < 0) {
         return TIENDA_PARAMETRO_INVALIDO;
     }
