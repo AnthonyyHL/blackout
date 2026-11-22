@@ -31,7 +31,7 @@ static const char tipo_prueba[] = "PRUEBA_VENTA ";
 static const char recibido[] = "RECIBIDO\n";
 static const char rechazado[] = "ERROR\n";
 
-static int64_t reloj_ms(void) {
+int64_t red_reloj_ms(void) {
     struct timespec ahora;
     if (clock_gettime(CLOCK_MONOTONIC, &ahora) == -1) {
         return -1;
@@ -40,7 +40,7 @@ static int64_t reloj_ms(void) {
 }
 
 static int64_t nuevo_plazo(void) {
-    int64_t ahora = reloj_ms();
+    int64_t ahora = red_reloj_ms();
     return ahora < 0 ? -1 : ahora + RED_PLAZO_MS;
 }
 
@@ -50,7 +50,7 @@ static bool esperar(int fd, short evento, int64_t vence) {
     }
     struct pollfd objetivo = {.fd = fd, .events = evento};
     for (;;) {
-        int64_t ahora = reloj_ms();
+        int64_t ahora = red_reloj_ms();
         if (ahora < 0) {
             return false;
         }
@@ -60,7 +60,7 @@ static bool esperar(int fd, short evento, int64_t vence) {
         }
         int estado = poll(&objetivo, 1, (int)(vence - ahora));
         if (estado > 0) {
-            ahora = reloj_ms();
+            ahora = red_reloj_ms();
             if (ahora < 0) {
                 return false;
             }
@@ -77,7 +77,7 @@ static bool esperar(int fd, short evento, int64_t vence) {
     }
 }
 
-static bool preparar_conexion(int fd) {
+bool red_no_bloqueante(int fd) {
     int opciones = fcntl(fd, F_GETFL);
     return opciones != -1 && fcntl(fd, F_SETFL, opciones | O_NONBLOCK) != -1;
 }
@@ -116,7 +116,7 @@ static ResultadoLinea leer_linea(int fd, LectorRed *lector, char linea[RED_MAX_L
                 }
                 return LINEA_ERROR;
             }
-            lector->recibido_en = reloj_ms();
+            lector->recibido_en = red_reloj_ms();
             if (lector->recibido_en < 0) {
                 return LINEA_ERROR;
             }
@@ -174,7 +174,7 @@ static int conectar(const ConfigTienda *destino) {
     if (fd == -1) {
         return -1;
     }
-    if (!preparar_conexion(fd)) {
+    if (!red_no_bloqueante(fd)) {
         return cerrar_por_error(fd);
     }
     int64_t vence = nuevo_plazo();
@@ -227,10 +227,15 @@ static bool trama_valida(const ServidorRed *servidor, char *linea) {
     return errno != ERANGE && centavos <= INT64_MAX && strcmp(fin, "\n") == 0;
 }
 
+bool red_fin_solicitado(int fd) {
+    struct pollfd entrada = {.fd = fd, .events = POLLIN};
+    return poll(&entrada, 1, 0) > 0 && (entrada.revents & (POLLHUP | POLLERR | POLLNVAL));
+}
+
 static void atender(int fd, const ServidorRed *servidor) {
     LectorRed lector = {0};
     char linea[RED_MAX_LINEA + 1];
-    for (;;) {
+    while (!servidor->atender_local || !red_fin_solicitado(servidor->fin)) {
         // Los bytes de la siguiente línea ya recibidos conservan su hora de llegada.
         int64_t vence = lector.siguiente < lector.fin
                            ? lector.recibido_en + RED_PLAZO_MS : nuevo_plazo();
@@ -238,8 +243,18 @@ static void atender(int fd, const ServidorRed *servidor) {
         if (resultado == LINEA_FIN || resultado == LINEA_ERROR) {
             return;
         }
-        const char *respuesta = resultado == LINEA_COMPLETA && trama_valida(servidor, linea)
-                                    ? recibido : rechazado;
+        char local[RED_MAX_LINEA + 1];
+        const char *respuesta = rechazado;
+        if (resultado == LINEA_COMPLETA) {
+            if (strncmp(linea, tipo_prueba, sizeof tipo_prueba - 1) == 0) {
+                respuesta = trama_valida(servidor, linea) ? recibido : rechazado;
+            } else if (*linea && servidor->atender_local) {
+                if (!servidor->atender_local(servidor->canal, linea, local)) {
+                    return;
+                }
+                respuesta = local;
+            }
+        }
         if (!escribir_linea(fd, respuesta, strlen(respuesta), nuevo_plazo()) ||
             resultado != LINEA_COMPLETA) {
             return;
@@ -250,6 +265,19 @@ static void atender(int fd, const ServidorRed *servidor) {
 void *red_recibir(void *contexto) {
     const ServidorRed *servidor = contexto;
     for (;;) {
+        if (servidor->atender_local) {
+            struct pollfd entradas[] = {
+                {.fd = servidor->escucha, .events = POLLIN},
+                {.fd = servidor->fin, .events = POLLIN}
+            };
+            int estado = poll(entradas, 2, -1);
+            if (estado < 0 && errno == EINTR) {
+                continue;
+            }
+            if (estado < 0 || entradas[1].revents || !(entradas[0].revents & POLLIN)) {
+                return NULL;
+            }
+        }
         int fd = accept(servidor->escucha, NULL, NULL);
         if (fd == -1) {
             if (errno == EINTR || errno == ECONNABORTED) {
@@ -261,14 +289,52 @@ void *red_recibir(void *contexto) {
                 nanosleep(&pausa, NULL);
                 continue;
             }
+            if (servidor->atender_local) {
+                // Si el otro receptor ya aceptó la conexión, se vuelve a esperar.
+                if (errno == EAGAIN || errno == EWOULDBLOCK) {
+                    continue;
+                }
+                perror("accept");
+                return NULL;
+            }
             perror("accept");
             exit(EXIT_FAILURE);
         }
-        if (preparar_conexion(fd)) {
+        if (red_no_bloqueante(fd)) {
             atender(fd, servidor);
         }
         close(fd);
     }
+}
+
+bool red_intercambiar(const ConfigTienda *destino, const char *linea, char *respuesta,
+                      char *error, size_t capacidad_error) {
+    size_t longitud = strlen(linea);
+    if (longitud == 0 || longitud > RED_MAX_LINEA || linea[longitud - 1] != '\n') {
+        snprintf(error, capacidad_error, "mensaje demasiado largo");
+        return false;
+    }
+    int fd = conectar(destino);
+    if (fd == -1) {
+        snprintf(error, capacidad_error, "conexión con %s: %s", destino->id, strerror(errno));
+        return false;
+    }
+    bool exito = false;
+    if (!escribir_linea(fd, linea, longitud, nuevo_plazo())) {
+        snprintf(error, capacidad_error, "envío a %s: %s", destino->id, strerror(errno));
+    } else {
+        LectorRed lector = {0};
+        ResultadoLinea resultado = leer_linea(fd, &lector, respuesta, nuevo_plazo());
+        if (resultado == LINEA_ERROR) {
+            snprintf(error, capacidad_error, "respuesta de %s: %s", destino->id, strerror(errno));
+        } else if (resultado == LINEA_COMPLETA && *respuesta) {
+            exito = true;
+        } else {
+            snprintf(error, capacidad_error, "respuesta inválida o incompleta de %s", destino->id);
+        }
+    }
+    close(fd);
+    return exito;
 }
 
 bool red_enviar_prueba(const Configuracion *config, const ConfigTienda *origen,
@@ -279,32 +345,19 @@ bool red_enviar_prueba(const Configuracion *config, const ConfigTienda *origen,
         snprintf(error, capacidad_error, "destino o importe inválido para %s", origen->id);
         return false;
     }
-    char linea[RED_MAX_LINEA + 1];
+    char linea[RED_MAX_LINEA + 1], respuesta[RED_MAX_LINEA + 1];
     int longitud = snprintf(linea, sizeof linea, "%s%s %s %" PRId64 "\n", tipo_prueba,
                              config->cadenas[origen->cadena].id, origen->id, importe);
     if (longitud < 0 || longitud > RED_MAX_LINEA) {
         snprintf(error, capacidad_error, "mensaje demasiado largo");
         return false;
     }
-    int fd = conectar(destino);
-    if (fd == -1) {
-        snprintf(error, capacidad_error, "conexión con %s: %s", destino->id, strerror(errno));
+    if (!red_intercambiar(destino, linea, respuesta, error, capacidad_error)) {
         return false;
     }
-    bool exito = false;
-    if (!escribir_linea(fd, linea, (size_t)longitud, nuevo_plazo())) {
-        snprintf(error, capacidad_error, "envío a %s: %s", destino->id, strerror(errno));
-    } else {
-        LectorRed lector = {0};
-        ResultadoLinea resultado = leer_linea(fd, &lector, linea, nuevo_plazo());
-        if (resultado == LINEA_ERROR) {
-            snprintf(error, capacidad_error, "respuesta de %s: %s", destino->id, strerror(errno));
-        } else if (resultado == LINEA_COMPLETA && strcmp(linea, recibido) == 0) {
-            exito = true;
-        } else {
-            snprintf(error, capacidad_error, "respuesta inválida o incompleta de %s", destino->id);
-        }
+    if (strcmp(respuesta, recibido) != 0) {
+        snprintf(error, capacidad_error, "respuesta inválida o incompleta de %s", destino->id);
+        return false;
     }
-    close(fd);
-    return exito;
+    return true;
 }

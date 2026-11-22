@@ -1,5 +1,6 @@
 #include "configuracion.h"
 #include "red.h"
+#include "tienda_cadena.h"
 
 #include <errno.h>
 #include <inttypes.h>
@@ -11,8 +12,10 @@
 #include <unistd.h>
 
 int main(int argc, char *argv[]) {
-    if (argc != 3 && argc != 5) {
-        fprintf(stderr, "Uso: %s config.json ID_TIENDA [ID_PAR IMPORTE_CENTAVOS]\n", argv[0]);
+    bool modo_cadena = argc >= 4 && strcmp(argv[3], "--cadena") == 0;
+    if (argc != 3 && argc != 5 && !(argc == 4 && modo_cadena)) {
+        fprintf(stderr, "Uso: %s config.json ID_TIENDA [ID_PAR IMPORTE_CENTAVOS | --cadena [PAR_INICIAL]]\n",
+                argv[0]);
         return EXIT_FAILURE;
     }
     Configuracion config;
@@ -29,7 +32,13 @@ int main(int argc, char *argv[]) {
 
     const ConfigTienda *destino = NULL;
     intmax_t importe = 0;
-    if (argc == 5) {
+    if (modo_cadena && argc == 5) {
+        destino = configuracion_buscar(&config, argv[4]);
+        if (!destino || destino == tienda || destino->cadena != tienda->cadena) {
+            fprintf(stderr, "Par inicial de cadena inválido\n");
+            return EXIT_FAILURE;
+        }
+    } else if (argc == 5) {
         destino = configuracion_buscar(&config, argv[3]);
         char *fin;
         errno = 0;
@@ -48,7 +57,11 @@ int main(int argc, char *argv[]) {
         perror("SIGPIPE");
         return EXIT_FAILURE;
     }
-    ServidorRed servidor = {red_escuchar(tienda), &config, tienda};
+    if (modo_cadena) {
+        setvbuf(stdout, NULL, _IOLBF, 0);
+        return tienda_cadena_ejecutar(&config, tienda, destino);
+    }
+    ServidorRed servidor = {.escucha = red_escuchar(tienda), .config = &config, .tienda = tienda};
     if (servidor.escucha == -1) {
         fprintf(stderr, "%s, %s:%u: %s\n", tienda->id, tienda->direccion,
                 (unsigned)tienda->puerto, strerror(errno));
