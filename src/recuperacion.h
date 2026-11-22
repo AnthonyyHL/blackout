@@ -20,4 +20,7 @@ bool recuperacion_acordar(const Configuracion *config, const ConfigTienda *propi
 bool recuperacion_buscar(const Configuracion *config, const ConfigTienda *propia,
                          const CambioLista *guardada, int fin);
 
+bool recuperacion_sincronizar(const Configuracion *config, const char *cadena,
+                             const CambioLista *lista, int fin, int64_t vence);
+
 #endif

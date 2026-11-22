@@ -78,8 +78,14 @@ static bool reproducir(const Configuracion *config, const char *cadena, const Ca
             continue;
         }
         char respuesta[RED_MAX_LINEA + 1], esperada[RED_MAX_LINEA + 1];
-        snprintf(esperada, sizeof esperada, "HECHA %s %s %" PRId64 " %" PRId64 " %zu %" PRIu32 "\n",
-                 cadena, id_origen, secuencia, importe, i, cambio->version);
+        if (cambio->version == 1) {
+            snprintf(esperada, sizeof esperada, "APLICADA %s %s %" PRId64 " %" PRId64 " %zu\n",
+                     cadena, id_origen, secuencia, importe, i);
+        } else {
+            snprintf(esperada, sizeof esperada,
+                     "HECHA %s %s %" PRId64 " %" PRId64 " %zu %" PRIu32 "\n",
+                     cadena, id_origen, secuencia, importe, i, cambio->version);
+        }
         if (!pedir(par, fin, vence, respuesta,
                    "RECUP %s %s %" PRId64 " %" PRId64 " %zu %" PRIu32 "\n",
                    cadena, id_origen, secuencia, importe, previa, cambio->version) ||
@@ -95,8 +101,8 @@ static bool reproducir(const Configuracion *config, const char *cadena, const Ca
  * Lee ventas aplicadas de cada archivo a través de su propietario.
  * Repetir un ID al encontrarlo en otro inventario es seguro.
  */
-static bool sincronizar(const Configuracion *config, const char *cadena, const CambioLista *cambio,
-                        int fin, int64_t vence) {
+bool recuperacion_sincronizar(const Configuracion *config, const char *cadena,
+                             const CambioLista *cambio, int fin, int64_t vence) {
     for (size_t i = 0; i < cambio->cantidad; ++i) {
         const ConfigTienda *par = &config->tiendas[cambio->orden[i]];
         for (size_t fila = 0; ; ++fila) {
@@ -151,7 +157,7 @@ bool recuperacion_acordar(const Configuracion *config, const ConfigTienda *propi
         }
     }
     if (listo && cambio->tipo != 'B') {
-        listo = sincronizar(config, cadena, cambio, fin, vence);
+        listo = recuperacion_sincronizar(config, cadena, cambio, fin, vence);
     }
     if (!listo || red_reloj_ms() >= vence) {
         // Registrar la cancelación evita que un PREPARAR tardío vuelva a abrir la ronda.

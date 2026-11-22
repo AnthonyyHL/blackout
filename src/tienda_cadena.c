@@ -1,6 +1,7 @@
 #include "tienda_cadena.h"
 #include "red.h"
 #include "recuperacion.h"
+#include "cierre.h"
 
 #include <errno.h>
 #include <fcntl.h>
@@ -16,7 +17,7 @@
 #include <unistd.h>
 
 enum { EMISOR = RED_RECEPTORES, TRABAJADORES = RED_RECEPTORES + 1,
-       REINTENTO_MS = 500, CAMPOS = CONFIG_MAX_TIENDAS + 2,
+       REINTENTO_MS = 500, CAMPOS = CONFIG_MAX_TIENDAS + 5,
        MAX_REGISTRO = CAMPOS * (CONFIG_MAX_ID + 1) };
 
 // Cada pipe lleva registros de tamaño fijo.
@@ -27,6 +28,7 @@ typedef struct {
     char linea[RED_MAX_LINEA + 1];
     char confirmacion[RED_MAX_LINEA + 1];
     CambioLista cambio;
+    enum TrabajoCierre cierre;
     bool inicio;
     bool buscar;
     bool exito;
@@ -54,6 +56,7 @@ typedef struct {
     char clave[CONFIG_MAX_ID + 1];
     uint64_t confirmadas;  // Un bit por identidad de config, independiente del orden actual.
     int64_t reintentar;    // Instante monotónico en ms. Cero permite intentar de inmediato.
+    bool cotejada;
 } Venta;
 
 /*
@@ -81,6 +84,9 @@ typedef struct {
     // el índice de la venta en curso o SIZE_MAX si el emisor está libre.
     size_t usadas, capacidad, proxima, en_envio;
     bool incorporando;
+    bool cerrando, conciliando, definitiva, solo_lectura, salir, informo_pendiente;
+    size_t cotejadas;
+    EvidenciaCierre cierre, borrador;
 } Cadena;
 
 static volatile sig_atomic_t avisar_fin = -1;
@@ -291,8 +297,17 @@ static void *emitir(void *contexto) {
         if (trabajo.inicio) {
             trabajo.exito = incorporarse(hilo, &trabajo);
         } else if (trabajo.buscar) {
-            trabajo.exito = recuperacion_buscar(hilo->red.config, hilo->red.tienda,
-                                                &trabajo.cambio, hilo->lectura);
+            trabajo.exito = cierre_buscar(hilo->red.config, hilo->red.tienda, hilo->lectura);
+            if (!trabajo.exito) {
+                trabajo.exito = recuperacion_buscar(hilo->red.config, hilo->red.tienda,
+                                                    &trabajo.cambio, hilo->lectura);
+            }
+        } else if (trabajo.cierre) {
+            trabajo.exito = cierre_ejecutar(hilo->red.config, hilo->red.tienda,
+                                             &trabajo.cambio, trabajo.cierre, hilo->lectura);
+            if (!trabajo.exito && trabajo.cierre == AVISAR_CIERRE) {
+                trabajo.exito = cierre_buscar(hilo->red.config, hilo->red.tienda, hilo->lectura);
+            }
         } else if (trabajo.cambio.tipo) {
             trabajo.exito = recuperacion_acordar(hilo->red.config, hilo->red.tienda,
                                                  &trabajo.cambio, hilo->lectura);
@@ -337,6 +352,18 @@ static bool anexar(Cadena *cadena, const char *linea) {
             return false;
         }
     }
+    return true;
+}
+
+static bool suspender(Cadena *cadena) {
+    if (cadena->cerrando) {
+        return !cadena->historial_dudoso;
+    }
+    cadena->cerrando = true;
+    if (!anexar(cadena, "CIERRE_EN_CURSO\n")) {
+        return false;
+    }
+    printf("CIERRE_EN_CURSO %s\n", cadena->tienda->id);
     return true;
 }
 
@@ -406,6 +433,10 @@ static const char *registrar(Cadena *cadena, Venta venta) {
     printf("APLICADA %s %s %" PRId64 " %" PRId64 " propio=%" PRId64 " total=%" PRId64 "\n",
            cadena->tienda->id, origen, venta.secuencia, venta.importe,
            cadena->ingreso_propio, cadena->total);
+    if (cadena->total >= cadena->config->cadenas[cadena->tienda->cadena].meta &&
+        !suspender(cadena)) {
+        return "ERROR_HISTORIAL\n";
+    }
     return NULL;
 }
 
@@ -431,6 +462,10 @@ static void compra(Cadena *cadena, char *campos[CAMPOS], char *respuesta) {
             }
             return;
         }
+    }
+    if (cadena->cerrando) {
+        strcpy(respuesta, "CIERRE_EN_CURSO\n");
+        return;
     }
     if (cadena->secuencia == INT64_MAX) {
         strcpy(respuesta, "DESBORDAMIENTO\n");
@@ -516,6 +551,10 @@ static void aplicar_remota(Cadena *cadena, char *campos[CAMPOS], char *respuesta
         }
         return;
     }
+    if (cadena->cierre.version || cadena->definitiva) {
+        strcpy(respuesta, "CIERRE_PREPARADO\n");
+        return;
+    }
     const char *error = registrar(cadena, venta);
     if (error) {
         strcpy(respuesta, error);
@@ -542,6 +581,7 @@ static bool instalar(Cadena *cadena, const CambioLista *cambio) {
     memcpy(cadena->orden, cambio->orden, cambio->cantidad);
     cadena->lista = true;
     cadena->reiniciada = false;
+    cadena->conciliando = false;
     for (size_t i = 0; i < cadena->usadas; ++i) {
         cadena->ventas[i].reintentar = 0;
     }
@@ -579,7 +619,8 @@ static bool preparar_cambio(Cadena *cadena, uint32_t version, uint32_t base, cha
                             size_t objetivo, size_t cantidad) {
     if (cantidad == 0 || cantidad > cadena->cantidad_configurada || version <= base ||
         base < cadena->version ||
-        objetivo >= CONFIG_MAX_TIENDAS) {
+        objetivo >= CONFIG_MAX_TIENDAS || cadena->cierre.version ||
+        (cadena->cerrando && (tipo != 'B' || objetivo == cadena->orden[0]))) {
         return false;
     }
     if (cadena->cambio.version) {
@@ -624,7 +665,8 @@ static bool atender_cambio(Cadena *cadena, char *campos[CAMPOS], size_t campos_u
         if (par < CONFIG_MAX_TIENDAS) {
             snprintf(respuesta, RED_MAX_LINEA + 1, "VIGENTE %" PRIu32 " %s %d %d\n",
                      cadena->version, cadena->config->tiendas[cadena->orden[0]].id,
-                     posicion(cadena, par) < cadena->cantidad, cadena->lista && !cadena->cambio.version);
+                     posicion(cadena, par) < cadena->cantidad,
+                     cadena->lista && !cadena->cambio.version && !cadena->cerrando);
         }
         return true;
     }
@@ -633,8 +675,11 @@ static bool atender_cambio(Cadena *cadena, char *campos[CAMPOS], size_t campos_u
         char tipo = strcmp(orden, "BAJA_ENSAYO") == 0 ? 'B' : strcmp(orden, "RETORNO") == 0 ? 'R' : 'I';
         size_t par = tienda_de(cadena, campos[2]);
         CambioLista propuesta;
-        if (cadena->lista && !cadena->cambio.version && !cadena->control_en_curso &&
+        if (cadena->lista && !cadena->cambio.version &&
+            (!cadena->control_en_curso || (cadena->cerrando && tipo == 'B')) &&
             !cadena->encargo.tipo && par != cadena->propia &&
+            !cadena->cierre.version &&
+            (!cadena->cerrando || (tipo == 'B' && par != cadena->orden[0])) &&
             (tipo != 'B' || strncmp(cadena->tienda->direccion, "127.", 4) == 0) &&
             formar_cambio(cadena, &propuesta, tipo, par) && propuesta.orden[0] == cadena->propia) {
             cadena->encargo = propuesta;
@@ -704,12 +749,328 @@ static bool atender_cambio(Cadena *cadena, char *campos[CAMPOS], size_t campos_u
     return false;
 }
 
+// Cierre comercial y evidencia persistente
+
+static size_t cantidad_miembros(const EvidenciaCierre *cierre) {
+    return cierre->participantes + cierre->excluidas;
+}
+
+static bool guardar_cabecera(Cadena *cadena, const char *tipo, const EvidenciaCierre *cierre) {
+    char linea[MAX_REGISTRO];
+    int largo = snprintf(linea, sizeof linea, "%s %" PRIu32 " %" PRId64 " %zu %zu", tipo,
+                         cierre->version, cierre->total, cierre->cantidad, cierre->participantes);
+    for (size_t i = 0; i < cantidad_miembros(cierre); ++i) {
+        largo += snprintf(linea + largo, sizeof linea - (size_t)largo,
+                          " %s", cadena->config->tiendas[cierre->miembros[i]].id);
+    }
+    snprintf(linea + largo, sizeof linea - (size_t)largo, "\n");
+    return anexar(cadena, linea);
+}
+
+static EvidenciaCierre propuesta_cierre(const Cadena *cadena) {
+    EvidenciaCierre cierre = {.version = cadena->version, .total = cadena->total,
+                              .cantidad = cadena->usadas, .participantes = cadena->cantidad};
+    memcpy(cierre.miembros, cadena->orden, cadena->cantidad);
+    for (size_t i = 0; i < cadena->config->cantidad_tiendas; ++i) {
+        if (cadena->config->tiendas[i].cadena == cadena->tienda->cadena &&
+            posicion(cadena, i) == cadena->cantidad) {
+            cierre.miembros[cierre.participantes + cierre.excluidas++] = (unsigned char)i;
+        }
+    }
+    return cierre;
+}
+
+static ItemCierre item(const Cadena *cadena, size_t fila) {
+    if (cadena->cierre.items) {
+        return cadena->cierre.items[fila];
+    }
+    const Venta *venta = &cadena->ventas[fila];
+    return (ItemCierre){venta->origen, venta->secuencia, venta->importe};
+}
+
+static bool misma_cabecera(const EvidenciaCierre *a, const EvidenciaCierre *b) {
+    return a->version == b->version && a->total == b->total && a->cantidad == b->cantidad &&
+           a->participantes == b->participantes && a->excluidas == b->excluidas &&
+           memcmp(a->miembros, b->miembros, cantidad_miembros(a)) == 0;
+}
+
+static bool guardar_decision(Cadena *cadena) {
+    if (!cadena->definitiva && !anexar(cadena, "CERRADA_META\n")) {
+        return false;
+    }
+    if (!cadena->definitiva) {
+        printf("CERRADA_META %s total=%" PRId64 " ventas=%zu\n",
+               cadena->tienda->id, cadena->cierre.total, cadena->cierre.cantidad);
+    }
+    cadena->definitiva = true;
+    return true;
+}
+
+static bool leer_item(Cadena *cadena, char **campos, ItemCierre *dato) {
+    dato->origen = tienda_de(cadena, campos[0]);
+    return dato->origen < CONFIG_MAX_TIENDAS &&
+           numero(campos[1], &dato->secuencia) && dato->secuencia > 0 &&
+           numero(campos[2], &dato->importe) && dato->importe > 0;
+}
+
+static bool conoce_item(const EvidenciaCierre *cierre, const ItemCierre *dato) {
+    for (size_t i = 0; i < cierre->items_leidos; ++i) {
+        if (cierre->items[i].origen == dato->origen &&
+            cierre->items[i].secuencia == dato->secuencia) {
+            return true;
+        }
+    }
+    return false;
+}
+
+static bool agregar_item(EvidenciaCierre *cierre, ItemCierre dato) {
+    if (cierre->items_leidos == cierre->cantidad || conoce_item(cierre, &dato)) {
+        return false;
+    }
+    cierre->items[cierre->items_leidos++] = dato;
+    return true;
+}
+
+static bool evidencia_completa(const EvidenciaCierre *cierre) {
+    if (cierre->miembros_leidos != cantidad_miembros(cierre) || cierre->items_leidos != cierre->cantidad) {
+        return false;
+    }
+    int64_t suma = 0;
+    for (size_t i = 0; i < cierre->cantidad; ++i) {
+        if (cierre->items[i].importe > INT64_MAX - suma) {
+            return false;
+        }
+        suma += cierre->items[i].importe;
+    }
+    return suma == cierre->total;
+}
+
+static bool guardar_importacion(Cadena *cadena) {
+    EvidenciaCierre *borrador = &cadena->borrador;
+    if (!evidencia_completa(borrador)) {
+        return false;
+    }
+    if (cadena->cierre.version) {
+        if (!misma_cabecera(&cadena->cierre, borrador)) {
+            return false;
+        }
+        for (size_t i = 0; i < borrador->cantidad; ++i) {
+            const ItemCierre *dato = &borrador->items[i];
+            const Venta *venta = venta_por_id(cadena, dato->origen, dato->secuencia);
+            if (!venta || venta->importe != dato->importe) {
+                return false;
+            }
+        }
+        return guardar_decision(cadena);
+    }
+    if (borrador->version < cadena->version ||
+        lugar_en(borrador->miembros + borrador->participantes, borrador->excluidas,
+                 cadena->propia) == borrador->excluidas ||
+        !guardar_cabecera(cadena, "CIERRE_IMPORTADO", borrador)) {
+        return false;
+    }
+    char linea[MAX_REGISTRO];
+    for (size_t i = 0; i < borrador->cantidad; ++i) {
+        const ItemCierre *dato = &borrador->items[i];
+        snprintf(linea, sizeof linea, "CIERRE_VENTA %s %" PRId64 " %" PRId64 "\n",
+                 cadena->config->tiendas[dato->origen].id, dato->secuencia, dato->importe);
+        if (!anexar(cadena, linea)) {
+            return false;
+        }
+    }
+    for (size_t i = 0; i < cadena->usadas; ++i) {
+        const Venta *venta = &cadena->ventas[i];
+        ItemCierre dato = {venta->origen, venta->secuencia, venta->importe};
+        if (venta->origen == cadena->propia && !conoce_item(borrador, &dato)) {
+            snprintf(linea, sizeof linea, "NO_INCLUIDA %s %" PRId64 " %" PRId64 "\n",
+                     cadena->tienda->id, venta->secuencia, venta->importe);
+            if (!anexar(cadena, linea)) {
+                return false;
+            }
+        }
+    }
+    cadena->cierre = *borrador;
+    *borrador = (EvidenciaCierre){0};
+    return guardar_decision(cadena);
+}
+
+static bool atender_evidencia(Cadena *cadena, char *campos[CAMPOS], size_t n, char *respuesta) {
+    EvidenciaCierre *cierre = &cadena->cierre;
+    const char *cmd = campos[0];
+    if (cadena->definitiva && cierre->version && n == 3) {
+        int64_t fila;
+        if (strcmp(cmd, "PRUEBA_CIERRE") == 0) {
+            snprintf(respuesta, RED_MAX_LINEA + 1, "CERRADA %" PRIu32 " %" PRId64 " %zu %zu %zu\n",
+                     cierre->version, cierre->total, cierre->cantidad, cierre->participantes, cierre->excluidas);
+            return true;
+        }
+        if (strcmp(cmd, "CIERRE_MIEMBRO") == 0 &&
+            (fila = siguiente(campos[2], cantidad_miembros(cierre))) >= 0) {
+            if ((size_t)fila == cantidad_miembros(cierre)) {
+                strcpy(respuesta, "FIN\n");
+            } else {
+                snprintf(respuesta, RED_MAX_LINEA + 1, "%s\n",
+                         cadena->config->tiendas[cierre->miembros[fila]].id);
+            }
+            return true;
+        }
+        if (strcmp(cmd, "CIERRE_DATO") == 0 && (fila = siguiente(campos[2], cierre->cantidad)) >= 0) {
+            if ((size_t)fila == cierre->cantidad) {
+                strcpy(respuesta, "FIN\n");
+            } else {
+                ItemCierre dato = item(cadena, (size_t)fila);
+                snprintf(respuesta, RED_MAX_LINEA + 1, "%s %" PRId64 " %" PRId64 "\n",
+                         cadena->config->tiendas[dato.origen].id, dato.secuencia, dato.importe);
+            }
+            return true;
+        }
+    }
+    if (cadena->solo_lectura || cadena->definitiva || (!cadena->reiniciada && !cadena->cierre.version)) {
+        return false;
+    }
+    EvidenciaCierre *borrador = &cadena->borrador;
+    if (n == 7 && strcmp(cmd, "EVIDENCIA_INICIO") == 0) {
+        int64_t version = siguiente(campos[2], UINT32_MAX), total;
+        int64_t ventas = siguiente(campos[4], SIZE_MAX / sizeof(ItemCierre));
+        int64_t activas = siguiente(campos[5], CONFIG_MAX_TIENDAS);
+        int64_t fuera = siguiente(campos[6], CONFIG_MAX_TIENDAS);
+        if (version <= 0 || !numero(campos[3], &total) || !total || ventas <= 0 ||
+            activas <= 0 || fuera < 0 || activas + fuera != (int64_t)cadena->cantidad_configurada) {
+            return true;
+        }
+        ItemCierre *items = calloc((size_t)ventas, sizeof *items);
+        if (items) {
+            free(borrador->items);
+            *borrador = (EvidenciaCierre){.version = (uint32_t)version, .total = total,
+                                         .cantidad = (size_t)ventas, .participantes = (size_t)activas,
+                                         .excluidas = (size_t)fuera, .items = items};
+            strcpy(respuesta, "CONTINUA\n");
+        }
+        return true;
+    }
+    if (!borrador->version) {
+        return false;
+    }
+    if (n == 3 && strcmp(cmd, "EVIDENCIA_MIEMBRO") == 0) {
+        size_t par = tienda_de(cadena, campos[2]);
+        if (par < CONFIG_MAX_TIENDAS && borrador->miembros_leidos < cantidad_miembros(borrador) &&
+            lugar_en(borrador->miembros, borrador->miembros_leidos, par) == borrador->miembros_leidos) {
+            borrador->miembros[borrador->miembros_leidos++] = (unsigned char)par;
+            strcpy(respuesta, "CONTINUA\n");
+        }
+        return true;
+    }
+    if (n == 5 && strcmp(cmd, "EVIDENCIA_VENTA") == 0) {
+        ItemCierre dato;
+        if (leer_item(cadena, campos + 2, &dato) && agregar_item(borrador, dato)) {
+            strcpy(respuesta, "CONTINUA\n");
+        }
+        return true;
+    }
+    if (n == 3 && strcmp(cmd, "EVIDENCIA_FIN") == 0 && guardar_importacion(cadena)) {
+        strcpy(respuesta, "GUARDADA\n");
+        cadena->salir = true;
+        return true;
+    }
+    return false;
+}
+
+/* La preparación fija el conjunto de ventas comprobado en este historial. */
+static bool atender_cierre(Cadena *cadena, char *campos[CAMPOS], size_t n, char *respuesta) {
+    const char *cmd = campos[0];
+    if (atender_evidencia(cadena, campos, n, respuesta)) {
+        return true;
+    }
+    int64_t version = siguiente(campos[n - 1], UINT32_MAX);
+    if (cadena->solo_lectura) {
+        return true;
+    }
+    if (n == 4 && strcmp(cmd, "AVISO_CIERRE") == 0 &&
+        siguiente(campos[2], UINT32_MAX) == cadena->version && cadena->cantidad &&
+        cadena->orden[0] == cadena->propia &&
+        posicion(cadena, tienda_de(cadena, campos[3])) < cadena->cantidad) {
+        if (suspender(cadena)) {
+            strcpy(respuesta, "AVISADA\n");
+        }
+        return true;
+    }
+    if (n == 3 && strcmp(cmd, "SALIR_CIERRE") == 0 && cadena->definitiva &&
+        version == cadena->cierre.version) {
+        strcpy(respuesta, "SALIDA\n");
+        cadena->salir = true;
+        return true;
+    }
+    if (n == 3 && strcmp(cmd, "DECIDIR_CIERRE") == 0 && version > 0 &&
+        version == cadena->cierre.version && guardar_decision(cadena)) {
+        strcpy(respuesta, "GUARDADA\n");
+        return true;
+    }
+    if (cadena->definitiva) {
+        return true;
+    }
+    if (n == 3 && strcmp(cmd, "CONGELAR_CIERRE") == 0 && version > 0 &&
+        version == cadena->version && !cadena->cambio.version && suspender(cadena)) {
+        cadena->conciliando = true;
+        cadena->cotejadas = 0;
+        for (size_t i = 0; i < cadena->usadas; ++i) {
+            cadena->ventas[i].cotejada = false;
+        }
+        strcpy(respuesta, "CONGELADA\n");
+        return true;
+    }
+    if (!cadena->conciliando || cadena->historial_dudoso) {
+        return false;
+    }
+    if (n == 6 && strcmp(cmd, "COTEJA") == 0 && version == cadena->version) {
+        ItemCierre dato;
+        if (leer_item(cadena, campos + 2, &dato)) {
+            Venta *venta = venta_por_id(cadena, dato.origen, dato.secuencia);
+            if (venta && venta->importe == dato.importe) {
+                if (!venta->cotejada) {
+                    venta->cotejada = true;
+                    ++cadena->cotejadas;
+                }
+                strcpy(respuesta, "COINCIDE\n");
+            } else {
+                strcpy(respuesta, "CONFLICTO\n");
+            }
+        }
+        return true;
+    }
+    if (n == 3 && strcmp(cmd, "RESUMEN_CIERRE") == 0 && version == cadena->version) {
+        snprintf(respuesta, RED_MAX_LINEA + 1, "RESUMEN %zu %" PRId64 "\n", cadena->usadas, cadena->total);
+        return true;
+    }
+    if (n == 5 && strcmp(cmd, "PREPARAR_CIERRE") == 0 &&
+        siguiente(campos[2], UINT32_MAX) == cadena->version) {
+        int64_t total, cantidad = siguiente(campos[3], cadena->usadas);
+        if (cantidad != (int64_t)cadena->usadas || cadena->cotejadas != cadena->usadas ||
+            !numero(campos[4], &total) || total != cadena->total ||
+            (!cadena->cierre.version && total < cadena->config->cadenas[cadena->tienda->cadena].meta)) {
+            strcpy(respuesta, "CONFLICTO\n");
+        } else if (cadena->cierre.version) {
+            strcpy(respuesta, "PREPARADA\n");
+        } else {
+            EvidenciaCierre cierre = propuesta_cierre(cadena);
+            if (guardar_cabecera(cadena, "CIERRE_PREPARADO", &cierre)) {
+                cadena->cierre = cierre;
+                printf("CIERRE_PREPARADO %s\n", cadena->tienda->id);
+                strcpy(respuesta, "PREPARADA\n");
+            }
+        }
+        return true;
+    }
+    return false;
+}
+
 static void atender(Cadena *cadena, char *linea, char *respuesta) {
     char *campos[CAMPOS];
     size_t cantidad = separar(linea, campos);
     strcpy(respuesta, "ERROR\n");
     if (cantidad == 3 && strcmp(campos[0], "COMPRA") == 0) {
-        if (cadena->lista && !cadena->cambio.version) {
+        if (cadena->solo_lectura || cadena->definitiva) {
+            strcpy(respuesta, "CERRADA_META\n");
+        } else if (cadena->cerrando || (cadena->lista && !cadena->cambio.version)) {
             compra(cadena, campos, respuesta);
         } else {
             strcpy(respuesta, cadena->cambio.version ? "CAMBIO_EN_CURSO\n" : "ORDEN_NO_LISTO\n");
@@ -719,11 +1080,14 @@ static void atender(Cadena *cadena, char *linea, char *respuesta) {
     if (cantidad < 3 || strcmp(campos[1], cadena->id_cadena) != 0) {
         return;
     }
-    if (atender_cambio(cadena, campos, cantidad, respuesta)) {
+    if (atender_cierre(cadena, campos, cantidad, respuesta) ||
+        atender_cambio(cadena, campos, cantidad, respuesta)) {
         return;
     }
-    if (cantidad == 4 && strcmp(campos[0], "FICHA") == 0 && cadena->cambio.version &&
-        siguiente(campos[3], UINT32_MAX) == cadena->cambio.version) {
+    uint32_t inventario = cadena->cambio.version ? cadena->cambio.version
+                                                : cadena->conciliando ? cadena->version : 0;
+    if (cantidad == 4 && strcmp(campos[0], "FICHA") == 0 && inventario &&
+        siguiente(campos[3], UINT32_MAX) == inventario) {
         int64_t indice = siguiente(campos[2], cadena->usadas);
         if (indice >= 0 && (size_t)indice == cadena->usadas) {
             strcpy(respuesta, "FIN\n");
@@ -732,8 +1096,8 @@ static void atender(Cadena *cadena, char *linea, char *respuesta) {
             snprintf(respuesta, RED_MAX_LINEA + 1, "FICHA %s %" PRId64 " %" PRId64 "\n",
                      cadena->config->tiendas[venta->origen].id, venta->secuencia, venta->importe);
         }
-    } else if (cantidad == 5 && strcmp(campos[0], "TIENE") == 0 && cadena->cambio.version &&
-               siguiente(campos[4], UINT32_MAX) == cadena->cambio.version) {
+    } else if (cantidad == 5 && strcmp(campos[0], "TIENE") == 0 && inventario &&
+               siguiente(campos[4], UINT32_MAX) == inventario) {
         size_t origen = tienda_de(cadena, campos[2]);
         int64_t secuencia;
         if (origen < CONFIG_MAX_TIENDAS && numero(campos[3], &secuencia) && secuencia > 0) {
@@ -750,6 +1114,9 @@ static void atender(Cadena *cadena, char *linea, char *respuesta) {
             cadena->verificados == marcados(cadena->cambio.cantidad)) {
             aplicar_remota(cadena, campos, respuesta, cadena->cambio.orden,
                            cadena->cambio.cantidad, cadena->cambio.version);
+        } else if (cadena->conciliando && !cadena->cambio.version &&
+                   siguiente(campos[6], UINT32_MAX) == cadena->version) {
+            aplicar_remota(cadena, campos, respuesta, cadena->orden, cadena->cantidad, cadena->version);
         } else {
             strcpy(respuesta, "VISTA_INCORRECTA\n");
         }
@@ -793,7 +1160,7 @@ static void atender(Cadena *cadena, char *linea, char *respuesta) {
     } else if ((cantidad == 6 && strcmp(campos[0], "VENTA") == 0) ||
                (cantidad == 7 && strcmp(campos[0], "VENTA2") == 0)) {
         int64_t version = cantidad == 6 ? 1 : siguiente(campos[6], UINT32_MAX);
-        if (version != cadena->version || cadena->cambio.version) {
+        if (version != cadena->version || cadena->cambio.version || cadena->conciliando) {
             strcpy(respuesta, "VISTA_INCORRECTA\n");
         } else if (cadena->lista) {
             aplicar_remota(cadena, campos, respuesta, cadena->orden, cadena->cantidad, cadena->version);
@@ -832,9 +1199,20 @@ static void terminar_envio(Cadena *cadena, const Mensaje *resultado) {
         }
         return;
     }
+    if (resultado->cierre) {
+        cadena->control_en_curso = false;
+        cadena->buscar_desde = red_reloj_ms() + REINTENTO_MS;
+        if (resultado->cierre != AVISAR_CIERRE && resultado->exito && cadena->definitiva) {
+            cadena->salir = true;
+        } else if (!resultado->exito && !cadena->informo_pendiente) {
+            printf("CIERRE_PENDIENTE %s\n", cadena->tienda->id);
+            cadena->informo_pendiente = true;
+        }
+        return;
+    }
     Venta *venta = &cadena->ventas[cadena->en_envio];
     cadena->en_envio = SIZE_MAX;
-    if (resultado->cambio.version != cadena->version || cadena->cambio.version) {
+    if (resultado->cambio.version != cadena->version || cadena->cambio.version || cadena->conciliando) {
         return;
     }
     const char *id_destino = cadena->config->tiendas[resultado->destino].id;
@@ -888,8 +1266,8 @@ static size_t turno_pendiente(const Cadena *cadena, const Venta *venta, size_t *
  * esperar un evento o -2 si falla el reloj.
  */
 static int programar(Cadena *cadena, Canal *emisor) {
-    if (cadena->historial_dudoso || cadena->cambio.version || cadena->control_en_curso ||
-        cadena->en_envio != SIZE_MAX || emisor->enviar) {
+    if (cadena->solo_lectura || cadena->salir || cadena->historial_dudoso || cadena->cambio.version ||
+        cadena->control_en_curso || cadena->en_envio != SIZE_MAX || emisor->enviar) {
         return -1;
     }
     int espera = -1;
@@ -897,9 +1275,28 @@ static int programar(Cadena *cadena, Canal *emisor) {
     if (ahora < 0) {
         return -2;
     }
+    if (cadena->encargo.tipo && cadena->cierre.version) {
+        cadena->encargo.tipo = 0;
+    }
     if (cadena->encargo.tipo) {
         emisor->salida = (Mensaje){.cambio = cadena->encargo};
         cadena->encargo.tipo = 0;
+        cadena->control_en_curso = emisor->enviar = true;
+        return -1;
+    }
+    if (cadena->cerrando && cadena->version) {
+        if (cadena->buscar_desde > ahora) {
+            return (int)(cadena->buscar_desde - ahora);
+        }
+        bool primera = cadena->orden[0] == cadena->propia;
+        if (cadena->definitiva && !primera) {
+            return -1;
+        }
+        enum TrabajoCierre trabajo = !primera ? AVISAR_CIERRE
+                                   : cadena->definitiva ? DISTRIBUIR_CIERRE : CONCILIAR_CIERRE;
+        emisor->salida = (Mensaje){.cierre = trabajo, .cambio = {.version = cadena->version,
+                                                               .cantidad = cadena->cantidad}};
+        memcpy(emisor->salida.cambio.orden, cadena->orden, cadena->cantidad);
         cadena->control_en_curso = emisor->enviar = true;
         return -1;
     }
@@ -1001,6 +1398,10 @@ static bool enviar_canal(Canal *canal) {
  */
 static bool atender_canales(Cadena *cadena, Canal canales[TRABAJADORES], int fin) {
     for (;;) {
+        // Entrega las respuestas ya formadas antes de cerrar los pipes.
+        if (cadena->salir && !canales[0].enviar && !canales[1].enviar) {
+            return true;
+        }
         int espera = programar(cadena, &canales[EMISOR]);
         if (espera < -1) {
             return false;
@@ -1086,10 +1487,79 @@ static bool leer_venta(Cadena *cadena, char *campos[CAMPOS], size_t cantidad) {
     return true;
 }
 
+static bool leer_cabecera_cierre(Cadena *cadena, char *campos[CAMPOS], size_t n, bool importada) {
+    if (n != 5 + cadena->cantidad_configurada || n < 6 || cadena->cierre.version) {
+        return false;
+    }
+    int64_t version = siguiente(campos[1], UINT32_MAX), total;
+    int64_t ventas = siguiente(campos[3], SIZE_MAX / sizeof(ItemCierre));
+    int64_t activas = siguiente(campos[4], n - 5);
+    if (version <= 0 || !numero(campos[2], &total) || !total || ventas <= 0 || activas <= 0) {
+        return false;
+    }
+    EvidenciaCierre cierre = {.version = (uint32_t)version, .total = total,
+                              .cantidad = (size_t)ventas, .participantes = (size_t)activas,
+                              .excluidas = n - 5 - (size_t)activas, .miembros_leidos = n - 5};
+    uint64_t vistos = 0;
+    for (size_t i = 0; i < cantidad_miembros(&cierre); ++i) {
+        size_t par = tienda_de(cadena, campos[i + 5]);
+        if (par == CONFIG_MAX_TIENDAS || (vistos & (UINT64_C(1) << par))) {
+            return false;
+        }
+        vistos |= UINT64_C(1) << par;
+        cierre.miembros[i] = (unsigned char)par;
+    }
+    if (importada) {
+        if (version < cadena->version ||
+            lugar_en(cierre.miembros + cierre.participantes, cierre.excluidas,
+                     cadena->propia) == cierre.excluidas) {
+            return false;
+        }
+        cierre.items = calloc(cierre.cantidad, sizeof *cierre.items);
+        if (!cierre.items) {
+            return false;
+        }
+    } else {
+        EvidenciaCierre esperada = propuesta_cierre(cadena);
+        if (!cadena->cerrando || !misma_cabecera(&cierre, &esperada)) {
+            return false;
+        }
+    }
+    cadena->cierre = cierre;
+    cadena->cerrando = true;
+    return true;
+}
+
 static bool leer_registro(Cadena *cadena, char *linea, uint32_t *preparada) {
     char *campos[CAMPOS];
     size_t cantidad = separar(linea, campos);
     if (!cantidad) {
+        return false;
+    }
+    if (cantidad == 1 && strcmp(campos[0], "CIERRE_EN_CURSO") == 0 && !cadena->cerrando) {
+        cadena->cerrando = true;
+        return true;
+    }
+    if (strcmp(campos[0], "CIERRE_PREPARADO") == 0 || strcmp(campos[0], "CIERRE_IMPORTADO") == 0) {
+        return !*preparada && leer_cabecera_cierre(cadena, campos, cantidad,
+                                                  strcmp(campos[0], "CIERRE_IMPORTADO") == 0);
+    }
+    if (cadena->cierre.version) {
+        if (cadena->cierre.items && cantidad == 4) {
+            ItemCierre dato;
+            if (!leer_item(cadena, campos + 1, &dato)) {
+                return false;
+            }
+            if (strcmp(campos[0], "CIERRE_VENTA") == 0) {
+                return agregar_item(&cadena->cierre, dato);
+            }
+            if (strcmp(campos[0], "NO_INCLUIDA") == 0 &&
+                cadena->cierre.items_leidos == cadena->cierre.cantidad) {
+                const Venta *venta = venta_por_id(cadena, dato.origen, dato.secuencia);
+                return dato.origen == cadena->propia && venta && venta->importe == dato.importe &&
+                       !conoce_item(&cadena->cierre, &dato);
+            }
+        }
         return false;
     }
     if (strcmp(campos[0], "APLICADA") == 0) {
@@ -1178,18 +1648,30 @@ static bool reconstruir(Cadena *cadena, const char *cabecera) {
         }
         valido = leer_registro(cadena, linea, &preparada);
     }
+    if (cerrada && (fgetc(archivo) != EOF ||
+                    (cadena->cierre.items && !evidencia_completa(&cadena->cierre)))) {
+        valido = false;
+    }
     if (ferror(archivo)) {
         valido = false;
     }
     if (fclose(archivo) != 0) {
         valido = false;
     }
+    if (!valido || (cadena->cierre.items && !cerrada)) {
+        fprintf(stderr, "Historial inválido o registro incompleto. Se conserva el archivo.\n");
+        return false;
+    }
     if (cerrada) {
+        if (cadena->solo_lectura && cadena->cierre.version && !preparada) {
+            cadena->definitiva = true;
+            return true;
+        }
         fprintf(stderr, "Tienda cerrada por meta. Se conserva el historial.\n");
         return false;
     }
-    if (!valido) {
-        fprintf(stderr, "Historial inválido o registro incompleto. Se conserva el archivo.\n");
+    if (cadena->solo_lectura) {
+        fprintf(stderr, "El historial no acredita una decisión de cierre.\n");
         return false;
     }
     if (preparada || !cadena->version) {
@@ -1202,7 +1684,8 @@ static bool reconstruir(Cadena *cadena, const char *cabecera) {
 
 static int abrir_historial(Cadena *cadena) {
     const char *ruta = cadena->tienda->historial;
-    int fd = open(ruta, O_RDWR | O_CREAT | O_APPEND | O_NONBLOCK, 0600);
+    int opciones = cadena->solo_lectura ? O_RDONLY : O_RDWR | O_CREAT | O_APPEND;
+    int fd = open(ruta, opciones | O_NONBLOCK, 0600);
     if (fd == -1) {
         perror(ruta);
         return -1;
@@ -1216,10 +1699,12 @@ static int abrir_historial(Cadena *cadena) {
     cadena->historial = fd;
     char cabecera[RED_MAX_LINEA];
     snprintf(cabecera, sizeof cabecera, "HISTORIAL5 %s %s\n", cadena->id_cadena, cadena->tienda->id);
-    bool valido = datos.st_size == 0 ? anexar(cadena, cabecera) : reconstruir(cadena, cabecera);
+    bool valido = datos.st_size == 0 && !cadena->solo_lectura ? anexar(cadena, cabecera)
+                                                             : reconstruir(cadena, cabecera);
     if (!valido) {
         close(fd);
         free(cadena->ventas);
+        free(cadena->cierre.items);
         return -1;
     }
     return fd;
@@ -1235,8 +1720,8 @@ static bool preparar_senales(int fin[2]) {
     return sigaction(SIGINT, &accion, NULL) == 0 && sigaction(SIGTERM, &accion, NULL) == 0;
 }
 
-int tienda_cadena_ejecutar(const Configuracion *config, const ConfigTienda *tienda,
-                          const ConfigTienda *entrada) {
+static int ejecutar(const Configuracion *config, const ConfigTienda *tienda,
+                    const ConfigTienda *entrada, bool solo_lectura) {
     int escucha = red_escuchar(tienda);
     if (escucha == -1) {
         perror("escucha de cadena");
@@ -1248,16 +1733,17 @@ int tienda_cadena_ejecutar(const Configuracion *config, const ConfigTienda *tien
         return EXIT_FAILURE;
     }
     Cadena cadena = {.config = config, .tienda = tienda, .id_cadena = config->cadenas[tienda->cadena].id,
-                     .propia = (size_t)(tienda - config->tiendas), .en_envio = SIZE_MAX};
-    cadena.historial = abrir_historial(&cadena);
-    if (cadena.historial == -1) {
-        close(escucha);
-        return EXIT_FAILURE;
-    }
+                     .propia = (size_t)(tienda - config->tiendas), .en_envio = SIZE_MAX,
+                     .solo_lectura = solo_lectura};
     for (size_t i = 0; i < config->cantidad_tiendas; ++i) {
         if (config->tiendas[i].cadena == tienda->cadena) {
             ++cadena.cantidad_configurada;
         }
+    }
+    cadena.historial = abrir_historial(&cadena);
+    if (cadena.historial == -1) {
+        close(escucha);
+        return EXIT_FAILURE;
     }
 
     Canal canales[TRABAJADORES] = {0};
@@ -1295,9 +1781,14 @@ int tienda_cadena_ejecutar(const Configuracion *config, const ConfigTienda *tien
         ++iniciados;
     }
 
-    if (cadena.reiniciada) {
+    if (cadena.solo_lectura) {
+        printf("CONSULTA_CIERRE %s\n", tienda->id);
+    } else if (cadena.reiniciada) {
         printf("RECUPERANDO %s propio=%" PRId64 " total=%" PRId64 "\n",
                tienda->id, cadena.ingreso_propio, cadena.total);
+        if (cadena.total >= config->cadenas[tienda->cadena].meta && !suspender(&cadena)) {
+            goto cerrar;
+        }
     } else if (entrada) {
         cadena.incorporando = true;
         canales[EMISOR].salida = (Mensaje){.destino = (size_t)(entrada - config->tiendas),
@@ -1346,5 +1837,16 @@ cerrar:
         estado = EXIT_FAILURE;
     }
     free(cadena.ventas);
+    free(cadena.cierre.items);
+    free(cadena.borrador.items);
     return estado;
+}
+
+int tienda_cadena_ejecutar(const Configuracion *config, const ConfigTienda *tienda,
+                          const ConfigTienda *entrada) {
+    return ejecutar(config, tienda, entrada, false);
+}
+
+int tienda_cadena_consultar_cierre(const Configuracion *config, const ConfigTienda *tienda) {
+    return ejecutar(config, tienda, NULL, true);
 }

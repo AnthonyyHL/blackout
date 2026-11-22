@@ -13,8 +13,9 @@
 
 int main(int argc, char *argv[]) {
     bool modo_cadena = argc >= 4 && strcmp(argv[3], "--cadena") == 0;
-    if (argc != 3 && argc != 5 && !(argc == 4 && modo_cadena)) {
-        fprintf(stderr, "Uso: %s config.json ID_TIENDA [ID_PAR IMPORTE_CENTAVOS | --cadena [PAR_INICIAL]]\n",
+    bool solo_cierre = argc == 4 && strcmp(argv[3], "--consultar-cierre") == 0;
+    if (argc != 3 && argc != 5 && !(argc == 4 && (modo_cadena || solo_cierre))) {
+        fprintf(stderr, "Uso: %s config.json ID_TIENDA [ID_PAR IMPORTE_CENTAVOS | --cadena [PAR_INICIAL] | --consultar-cierre]\n",
                 argv[0]);
         return EXIT_FAILURE;
     }
@@ -60,6 +61,10 @@ int main(int argc, char *argv[]) {
     if (modo_cadena) {
         setvbuf(stdout, NULL, _IOLBF, 0);
         return tienda_cadena_ejecutar(&config, tienda, destino);
+    }
+    if (solo_cierre) {
+        setvbuf(stdout, NULL, _IOLBF, 0);
+        return tienda_cadena_consultar_cierre(&config, tienda);
     }
     ServidorRed servidor = {.escucha = red_escuchar(tienda), .config = &config, .tienda = tienda};
     if (servidor.escucha == -1) {
