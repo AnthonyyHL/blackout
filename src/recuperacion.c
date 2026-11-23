@@ -137,7 +137,12 @@ bool recuperacion_sincronizar(const Configuracion *config, const char *cadena,
 bool recuperacion_acordar(const Configuracion *config, const ConfigTienda *propia,
                           const CambioLista *cambio, int fin) {
     const char *cadena = config->cadenas[propia->cadena].id;
-    const char *objetivo = config->tiendas[cambio->objetivo].id;
+    char objetivo[CONFIG_MAX_ID + 1];
+    if (cambio->tipo == 'M') {
+        snprintf(objetivo, sizeof objetivo, "%" PRIu64, cambio->bajas);
+    } else {
+        snprintf(objetivo, sizeof objetivo, "%s", config->tiendas[cambio->objetivo].id);
+    }
     int64_t ahora = red_reloj_ms();
     if (ahora < 0 || cambio->cantidad == 0) {
         return false;
@@ -156,7 +161,7 @@ bool recuperacion_acordar(const Configuracion *config, const ConfigTienda *propi
                     strcmp(respuesta, "VERIFICADO\n") == 0;
         }
     }
-    if (listo && cambio->tipo != 'B') {
+    if (listo && cambio->tipo != 'B' && cambio->tipo != 'M') {
         listo = recuperacion_sincronizar(config, cadena, cambio, fin, vence);
     }
     if (!listo || red_reloj_ms() >= vence) {

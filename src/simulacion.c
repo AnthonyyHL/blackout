@@ -19,11 +19,14 @@
 #include <unistd.h>
 
 enum {
-    CAPACIDAD = 4, RECEPCIONES_POR_TIENDA = 2, TRABAJADORES = 8,
+    CAPACIDAD = CONFIG_MAX_SOLICITUDES_EN_VUELO + CONFIG_MAX_COMPRAS_EN_ESPERA,
+    TRABAJADORES = 8,
     SIN_TRABAJO = -1, TRABAJO_BAJA = -2,
     ESPERA_REINTENTO = 250, SIN_PROGRESO_MS = 20000, ARRANQUE_MS = 8000,
     DETENCION_MS = 6000, LINEA_HIJO = CONFIG_MAX_TIENDAS * (CONFIG_MAX_ID + 1) + 128
 };
+
+_Static_assert(CONFIG_MAX_SOLICITUDES_EN_VUELO <= TRABAJADORES - 1, "Un trabajador se reserva para bajas");
 
 typedef enum { INACTIVA, ARRANCANDO, ABIERTA, PAUSADA, CERRANDO, CERRADA, ERROR_TIENDA } Estado;
 
@@ -35,6 +38,9 @@ typedef struct {
     bool incorporada, cortada, matando, excluida, saturada, bloqueo_reportado;
     size_t primera, cursor_baja;
     uint64_t vista;
+    unsigned char orden[CONFIG_MAX_TIENDAS];
+    size_t cantidad_vista;
+    uint32_t version;
     int64_t proxima, duracion, volver, revisar_baja;
     char linea[LINEA_HIJO];
     size_t leidos;
@@ -43,7 +49,9 @@ typedef struct {
 typedef struct {
     // La secuencia global también identifica la compra persistida en el diario.
     int64_t secuencia, importe, reintentar;
-    bool en_envio;
+    bool intentada; // El diario registra la encomienda del primer intento.
+    bool en_vuelo;  // Conserva una plaza mientras falta el resultado de admisión.
+    bool en_envio;  // Un trabajador está atendiendo el intento TCP actual.
 } Compra;
 
 typedef struct {
@@ -122,6 +130,15 @@ static Compra *libre(Simulacion *sim, size_t i) {
     return NULL;
 }
 
+static int compras_en_espera(const Simulacion *sim, size_t i) {
+    int cantidad = 0;
+    for (size_t j = 0; j < CAPACIDAD; ++j) {
+        const Compra *compra = &sim->compras[i][j];
+        cantidad += compra->secuencia > 0 && !compra->en_vuelo;
+    }
+    return cantidad;
+}
+
 // Diario del lanzador. Cada intención se completa antes de enviarla a una tienda.
 
 static bool guardar(Simulacion *sim, const char *formato, ...) {
@@ -160,11 +177,19 @@ static bool registro(Simulacion *sim, char *linea) {
         return false;
     }
     int64_t dato;
-    if (strcmp(tipo, "F") == 0 && !segundo && cifra(primero, &dato) && dato > 0) {
+    bool finalizada = strcmp(tipo, "F") == 0;
+    if ((finalizada || strcmp(tipo, "E") == 0) && !segundo && cifra(primero, &dato) && dato > 0) {
         for (size_t i = 0; i < sim->config.cantidad_tiendas; ++i) {
             for (size_t j = 0; j < CAPACIDAD; ++j) {
-                if (sim->compras[i][j].secuencia == dato) {
-                    sim->compras[i][j] = (Compra){0};
+                Compra *compra = &sim->compras[i][j];
+                if (compra->secuencia == dato) {
+                    if (finalizada) {
+                        *compra = (Compra){0};
+                    } else if (compra->intentada) {
+                        return false;
+                    } else {
+                        compra->intentada = true;
+                    }
                     return true;
                 }
             }
@@ -188,7 +213,7 @@ static bool registro(Simulacion *sim, char *linea) {
         return true;
     }
     Hijo *hijo = &sim->hijos[i];
-    if (strcmp(tipo, "B") == 0 && segundo && !tercero && !hijo->cortada && cifra(segundo, &dato) &&
+    if (strcmp(tipo, "B") == 0 && segundo && !tercero && cifra(segundo, &dato) &&
         dato <= INT_MAX) {
         hijo->cortada = true;
         hijo->duracion = dato;
@@ -199,6 +224,32 @@ static bool registro(Simulacion *sim, char *linea) {
         return true;
     }
     return false;
+}
+
+/* Al reanudar solo los intentos inciertos pueden ocupar las plazas en vuelo. */
+static bool cargar_capacidades(Simulacion *sim) {
+    for (size_t i = 0; i < sim->config.cantidad_tiendas; ++i) {
+        const ConfigCompras *config = &tienda(sim, i)->compras;
+        int pendientes = compras_en_espera(sim, i), intentadas = 0;
+        for (size_t j = 0; j < CAPACIDAD; ++j) {
+            intentadas += sim->compras[i][j].intentada;
+        }
+        int excedente = pendientes - config->max_compras_en_espera;
+        if (excedente > intentadas || excedente > config->max_solicitudes_en_vuelo) {
+            fprintf(stderr, "%s: capacidad insuficiente para reanudar %d compras pendientes (%d con intento registrado). "
+                    "Revise max_solicitudes_en_vuelo=%d y max_compras_en_espera=%d. Se conservan los archivos.\n",
+                    tienda(sim, i)->id, pendientes, intentadas, config->max_solicitudes_en_vuelo,
+                    config->max_compras_en_espera);
+            return false;
+        }
+        for (size_t j = 0; j < CAPACIDAD && excedente > 0; ++j) {
+            if (sim->compras[i][j].intentada) {
+                sim->compras[i][j].en_vuelo = true;
+                --excedente;
+            }
+        }
+    }
+    return true;
 }
 
 static bool cabecera(Simulacion *sim, bool reanudar) {
@@ -272,6 +323,9 @@ static bool abrir_diario(Simulacion *sim, bool reanudar) {
         if (ferror(sim->diario) || fseek(sim->diario, 0, SEEK_END) != 0) {
             goto invalido;
         }
+        if (!cargar_capacidades(sim)) {
+            return false;
+        }
     }
     return true;
 
@@ -335,6 +389,7 @@ static bool iniciar_tienda(Simulacion *sim, size_t i, const char *entrada) {
     hijo->estado = ARRANCANDO;
     hijo->incorporada = false;
     hijo->vista = 0;
+    hijo->version = 0;
     hijo->leidos = 0;
     printf("PROCESO_TIENDA %s pid=%ld\n", t->id, (long)pid);
     return true;
@@ -410,10 +465,12 @@ static void aviso_hijo(Simulacion *sim, size_t i, char *linea, int64_t ahora) {
         (void)strtok_r(linea + 6, " ", &resto);
         uint64_t vista = 0;
         size_t primera = CONFIG_MAX_TIENDAS;
+        hijo->cantidad_vista = 0;
         for (char *nombre = strtok_r(NULL, " ", &resto); nombre; nombre = strtok_r(NULL, " ", &resto)) {
             const ConfigTienda *par = configuracion_buscar(&sim->config, nombre);
-            if (par && par->cadena == tienda(sim, i)->cadena) {
+            if (par && par->cadena == tienda(sim, i)->cadena && hijo->cantidad_vista < CONFIG_MAX_TIENDAS) {
                 size_t j = (size_t)(par - sim->config.tiendas);
+                hijo->orden[hijo->cantidad_vista++] = (unsigned char)j;
                 if (!vista) {
                     primera = j;
                 }
@@ -422,6 +479,9 @@ static void aviso_hijo(Simulacion *sim, size_t i, char *linea, int64_t ahora) {
         }
         hijo->primera = primera;
         hijo->vista = vista;
+        hijo->version = 0;
+    } else if (sscanf(linea, "VISTA %*s %" SCNu32, &hijo->version) == 1) {
+        return;
     } else if (strncmp(linea, "INCORPORADA ", 12) == 0) {
         hijo->incorporada = true;
         return;
@@ -512,7 +572,11 @@ static void recoger_tiendas(Simulacion *sim, int64_t ahora, bool saliendo) {
                 printf("ERROR_PROCESO %s estado=%d cierre_acreditado\n", tienda(sim, i)->id, estado);
                 sim->error = true;
             }
-        } else if (hijo->matando && WIFSIGNALED(estado) && WTERMSIG(estado) == SIGKILL) {
+        } else if ((WIFSIGNALED(estado) && WTERMSIG(estado) == SIGKILL && (hijo->matando || !saliendo)) ||
+                   (!saliendo && WIFEXITED(estado) && WEXITSTATUS(estado) == EXIT_SUCCESS)) {
+            if (!hijo->matando) {
+                hijo->duracion = (int64_t)(sim->config.interrupciones.caida_min_s * 1000);
+            }
             hijo->estado = INACTIVA;
             hijo->cortada = true;
             hijo->volver = ahora + hijo->duracion;
@@ -602,7 +666,7 @@ static void generar(Simulacion *sim, int64_t ahora) {
         }
         hijo->proxima = ahora + config->intervalo_ms;
         Compra *sitio = libre(sim, i);
-        if (!sitio) {
+        if (!sitio || compras_en_espera(sim, i) >= config->max_compras_en_espera) {
             if (!hijo->saturada) {
                 printf("CAPACIDAD_COMPRAS %s\n", tienda(sim, i)->id);
             }
@@ -642,18 +706,21 @@ static int proxima_compra(const Simulacion *sim, size_t i, int64_t ahora) {
     if (hijo->estado != ABIERTA || hijo->matando) {
         return SIN_TRABAJO;
     }
-    size_t enviadas = 0;
+    int en_vuelo = 0;
+    for (int j = 0; j < CAPACIDAD; ++j) {
+        en_vuelo += sim->compras[i][j].en_vuelo;
+    }
+    int limite = tienda(sim, i)->compras.max_solicitudes_en_vuelo;
     int elegida = SIN_TRABAJO;
     for (int j = 0; j < CAPACIDAD; ++j) {
         const Compra *compra = &sim->compras[i][j];
-        if (compra->en_envio) {
-            ++enviadas;
-        } else if (compra->secuencia && compra->reintentar <= ahora &&
-                   (elegida == SIN_TRABAJO || compra->secuencia < sim->compras[i][elegida].secuencia)) {
+        if (compra->secuencia && !compra->en_envio && compra->reintentar <= ahora &&
+            (compra->en_vuelo || en_vuelo < limite) &&
+            (elegida == SIN_TRABAJO || compra->secuencia < sim->compras[i][elegida].secuencia)) {
             elegida = j;
         }
     }
-    return enviadas < RECEPCIONES_POR_TIENDA ? elegida : SIN_TRABAJO;
+    return elegida;
 }
 
 static void enviar_compras(Simulacion *sim, int64_t ahora) {
@@ -674,7 +741,12 @@ static void enviar_compras(Simulacion *sim, int64_t ahora) {
             char clave[CONFIG_MAX_ID + 1];
             clave_compra(clave, compra->secuencia);
             snprintf(peticion.linea, sizeof peticion.linea, "COMPRA %s %" PRId64 "\n", clave, compra->importe);
+            if (!compra->intentada && !guardar(sim, "E %" PRId64 "\n", compra->secuencia)) {
+                return;
+            }
+            compra->intentada = true;
             if (entregar(sim, trabajador, &peticion, (int)i * CAPACIDAD + j)) {
+                compra->en_vuelo = true;
                 compra->en_envio = true;
                 sim->siguiente = (i + 1) % tiendas;
                 printf("COMPRA_INTENTO %s %s\n", tienda(sim, i)->id, clave);
@@ -736,6 +808,10 @@ static void recibir_resultados(Simulacion *sim, int64_t ahora) {
                  strcmp(respuesta, "ERROR_HISTORIAL\n") == 0)) {
                 sim->hijos[i].estado = CERRANDO;
             }
+            // Si la espera está llena, el intento incierto conserva su plaza en vuelo.
+            if (compras_en_espera(sim, i) < tienda(sim, i)->compras.max_compras_en_espera) {
+                compra->en_vuelo = false;
+            }
             compra->reintentar = ahora + ESPERA_REINTENTO;
         }
     }
@@ -795,70 +871,128 @@ static void sortear_cortes(Simulacion *sim) {
     if (config.probabilidad_caida == 0) {
         return;
     }
-    bool ocupada[CONFIG_MAX_CADENAS] = {false};
-    for (size_t i = 0; i < sim->config.cantidad_tiendas; ++i) {
-        Hijo *hijo = &sim->hijos[i];
-        if (tienda(sim, i)->cadena >= 0 && (hijo->cortada || hijo->matando || hijo->estado == ARRANCANDO)) {
-            ocupada[tienda(sim, i)->cadena] = true;
-        }
-    }
     for (size_t i = 0; i < sim->config.cantidad_tiendas && !detener; ++i) {
         Hijo *hijo = &sim->hijos[i];
-        int grupo = tienda(sim, i)->cadena;
-        if (hijo->estado != ABIERTA || !hijo->pid || hijo->matando) {
+        if ((hijo->estado != ABIERTA && hijo->estado != PAUSADA) || !hijo->pid || hijo->matando || hijo->cortada) {
             continue;
         }
         double valor = sorteo();
         if (valor >= config.probabilidad_caida) {
             continue;
         }
-        if (grupo >= 0 && ocupada[grupo]) {
-            printf("CORTE_OMITIDO_MODELO %s\n", tienda(sim, i)->id);
-            continue;
-        }
         hijo->duracion = (int64_t)(1000 * (config.caida_min_s + sorteo() * (config.caida_max_s - config.caida_min_s)));
         if (kill(hijo->pid, SIGKILL) == 0) {
             hijo->matando = true;
-            if (grupo >= 0) {
-                ocupada[grupo] = true;
-            }
         }
     }
 }
 
 static bool baja_instalada(Simulacion *sim, size_t i, int64_t ahora) {
     int grupo = tienda(sim, i)->cadena;
-    bool instalada = true;
     Hijo *baja = &sim->hijos[i];
-    for (size_t k = 0; grupo >= 0 && k < sim->config.cantidad_tiendas; ++k) {
+    if (grupo < 0) {
+        return true;
+    }
+    uint64_t bajas = 0, vista = 0;
+    uint32_t version = 0;
+    const Hijo *referencia = NULL;
+    bool instalada = true, vistas_estables = true;
+    for (size_t j = 0; j < sim->config.cantidad_tiendas; ++j) {
+        const Hijo *par = &sim->hijos[j];
+        if (tienda(sim, j)->cadena != grupo) {
+            continue;
+        }
+        if (!par->pid && par->cortada && par->estado != CERRADA) {
+            bajas |= UINT64_C(1) << j;
+        } else if (par->pid) {
+            if (!par->version || (par->vista & (UINT64_C(1) << i))) {
+                instalada = false;
+            }
+            if (!par->version || !par->vista || par->matando || par->estado == PAUSADA ||
+                (referencia && (version != par->version || vista != par->vista ||
+                                par->cantidad_vista != referencia->cantidad_vista ||
+                                memcmp(par->orden, referencia->orden, par->cantidad_vista) != 0))) {
+                vistas_estables = false;
+            }
+            vista = par->vista;
+            version = par->version;
+            referencia = par;
+        }
+    }
+    if (!vistas_estables) {
+        return false;
+    }
+    bajas &= vista;
+    if (instalada) {
+        return bajas == 0;
+    }
+    Trabajador *control = &sim->trabajadores[0];
+    if (!control->pid || control->trabajo != SIN_TRABAJO || ahora < baja->revisar_baja) {
+        return false;
+    }
+    for (size_t k = 0; k < sim->config.cantidad_tiendas; ++k) {
         size_t j = (baja->cursor_baja + k) % sim->config.cantidad_tiendas;
         Hijo *par = &sim->hijos[j];
         if (i == j || grupo != tienda(sim, j)->cadena || !par->pid) {
             continue;
         }
-        if (!par->vista) {
-            instalada = false;
-            continue;
-        }
-        if (!(par->vista & (UINT64_C(1) << i))) {
-            continue;
-        }
-        instalada = false;
-        Trabajador *control = &sim->trabajadores[0];
-        if (control->pid && control->trabajo == SIN_TRABAJO && ahora >= baja->revisar_baja &&
-            (par->primera == j || par->primera == i)) {
-            // Si cayó la primera, solo su sucesora en la vista aceptará la propuesta.
+        if (par->primera == j || (bajas & (UINT64_C(1) << par->primera))) {
+            // Si cayó la primera, solo la primera superviviente acepta la propuesta.
             Peticion peticion = {.destino = j};
-            snprintf(peticion.linea, sizeof peticion.linea, "BAJA_ENSAYO %s %s\n", cadena(sim, i), tienda(sim, i)->id);
+            uint64_t posiciones = 0;
+            for (size_t pos = 0; pos < par->cantidad_vista; ++pos) {
+                if (bajas & (UINT64_C(1) << par->orden[pos])) {
+                    posiciones |= UINT64_C(1) << pos;
+                }
+            }
+            snprintf(peticion.linea, sizeof peticion.linea, "BAJAS_ENSAYO %s %" PRIu32 " %" PRIu64 "\n",
+                     cadena(sim, i), version, posiciones);
             entregar(sim, control, &peticion, TRABAJO_BAJA);
             baja->cursor_baja = (j + 1) % sim->config.cantidad_tiendas;
             baja->revisar_baja = ahora + ESPERA_REINTENTO;
+            break;
         }
     }
     return instalada;
 }
 
+static void reiniciar_tienda(Simulacion *sim, size_t i) {
+    printf("REINICIO %s\n", tienda(sim, i)->id);
+    if (!iniciar_tienda(sim, i, NULL)) {
+        sim->error = true;
+    }
+}
+
+/* Sin supervivientes, los miembros de la vista guardada deben poder encontrarse al volver. */
+static void reiniciar_cadena_caida(Simulacion *sim, int grupo, int64_t ahora) {
+    for (size_t i = 0; i < sim->config.cantidad_tiendas; ++i) {
+        const Hijo *hijo = &sim->hijos[i];
+        if (tienda(sim, i)->cadena == grupo && hijo->estado != CERRADA &&
+            (!hijo->cortada || ahora < hijo->volver || hijo->archivo == ARCHIVO_BLOQUEADO)) {
+            return;
+        }
+    }
+    for (size_t i = 0; i < sim->config.cantidad_tiendas && !sim->error; ++i) {
+        if (tienda(sim, i)->cadena == grupo && sim->hijos[i].estado != CERRADA) {
+            reiniciar_tienda(sim, i);
+        }
+    }
+}
+
 static void tramitar_bajas(Simulacion *sim, int64_t ahora, bool permitir_retorno) {
+    bool hay_supervivientes[CONFIG_MAX_CADENAS] = {false};
+    for (size_t i = 0; i < sim->config.cantidad_tiendas; ++i) {
+        int grupo = tienda(sim, i)->cadena;
+        if (grupo >= 0 && sim->hijos[i].pid) {
+            hay_supervivientes[grupo] = true;
+        }
+    }
+    bool reiniciar = permitir_retorno && sim->config.interrupciones.recuperacion_auto;
+    for (size_t grupo = 0; reiniciar && grupo < sim->config.cantidad_cadenas && !sim->error; ++grupo) {
+        if (!hay_supervivientes[grupo]) {
+            reiniciar_cadena_caida(sim, (int)grupo, ahora);
+        }
+    }
     for (size_t i = 0; i < sim->config.cantidad_tiendas; ++i) {
         Hijo *hijo = &sim->hijos[i];
         if (hijo->pid || !hijo->cortada || hijo->estado == CERRADA) {
@@ -872,11 +1006,9 @@ static void tramitar_bajas(Simulacion *sim, int64_t ahora, bool permitir_retorno
                 fprintf(stderr, "%s: el corte dejó un historial pendiente o inválido.\n", tienda(sim, i)->id);
                 hijo->bloqueo_reportado = true;
             }
-        } else if (permitir_retorno && sim->config.interrupciones.recuperacion_auto && ahora >= hijo->volver) {
-            printf("REINICIO %s\n", tienda(sim, i)->id);
-            if (!iniciar_tienda(sim, i, NULL)) {
-                sim->error = true;
-            }
+        } else if (reiniciar && ahora >= hijo->volver &&
+                   (tienda(sim, i)->cadena < 0 || hay_supervivientes[tienda(sim, i)->cadena])) {
+            reiniciar_tienda(sim, i);
         }
     }
 }
@@ -995,6 +1127,7 @@ static bool ejecutar(Simulacion *sim) {
             sortear_cortes(sim);
             evaluar = ahora + intervalo;
         }
+        enviar_compras(sim, ahora);
         generar(sim, ahora);
         enviar_compras(sim, ahora);
         esperar_eventos(sim, espera_siguiente(sim, ahora));

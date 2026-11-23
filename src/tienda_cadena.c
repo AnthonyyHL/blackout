@@ -193,6 +193,16 @@ static int64_t siguiente(const char *campo, size_t maximo) {
     return numero(campo, &valor) && (uint64_t)valor <= maximo ? valor : -1;
 }
 
+static uint64_t leer_bajas(const char *campo) {
+    if (*campo < '1' || *campo > '9') {
+        return 0;
+    }
+    errno = 0;
+    char *fin;
+    uintmax_t bajas = strtoumax(campo, &fin, 10);
+    return errno == ERANGE || *fin || bajas > UINT64_MAX ? 0 : (uint64_t)bajas;
+}
+
 static bool solicitar(Trabajador *hilo, const ConfigTienda *destino,
                       const char *linea, char *respuesta) {
     char error[256];
@@ -634,18 +644,42 @@ static bool formar_cambio(const Cadena *cadena, CambioLista *cambio, char tipo, 
            (tipo != 'R' || cambio->orden[cambio->cantidad - 1] == objetivo);
 }
 
+/* Valida las bajas sobre una sola vista y conserva el orden de las supervivientes. */
+static bool formar_bajas(const Cadena *cadena, CambioLista *cambio, uint64_t bajas) {
+    if (!bajas || !cadena->version || cadena->version == UINT32_MAX ||
+        cadena->ultima_propuesta == UINT32_MAX) {
+        return false;
+    }
+    if (bajas & ~marcados(cadena->cantidad)) {
+        return false;
+    }
+    uint32_t ultima = cadena->ultima_propuesta > cadena->version ? cadena->ultima_propuesta : cadena->version;
+    *cambio = (CambioLista){.version = ultima + 1, .base = cadena->version, .tipo = 'M', .bajas = bajas};
+    for (size_t i = 0; i < cadena->cantidad; ++i) {
+        if (!(bajas & (UINT64_C(1) << i))) {
+            cambio->orden[cambio->cantidad++] = cadena->orden[i];
+        }
+    }
+    return lugar_en(cambio->orden, cambio->cantidad, cadena->propia) < cambio->cantidad;
+}
+
 static bool preparar_cambio(Cadena *cadena, uint32_t version, uint32_t base, char tipo,
-                            size_t objetivo, size_t cantidad) {
+                            const char *destino, size_t cantidad) {
+    size_t objetivo = tipo == 'M' ? 0 : tienda_de(cadena, destino);
+    uint64_t bajas = tipo == 'M' ? leer_bajas(destino) : 0;
+    bool baja = tipo == 'B' || tipo == 'M';
     if (cantidad == 0 || cantidad > cadena->cantidad_configurada || version <= base ||
         base < cadena->version ||
         objetivo >= CONFIG_MAX_TIENDAS || cadena->cierre.version ||
-        (cadena->cerrando && (tipo != 'B' || objetivo == cadena->orden[0]))) {
+        (tipo == 'M' && (!bajas || strncmp(cadena->tienda->direccion, "127.", 4) != 0)) ||
+        (cadena->cerrando && (!baja || (tipo == 'B' && objetivo == cadena->orden[0]) ||
+                             (bajas & UINT64_C(1))))) {
         return false;
     }
     if (cadena->cambio.version) {
         return cadena->cambio.version == version && cadena->cambio.tipo == tipo &&
                cadena->cambio.base == base && cadena->cambio.objetivo == objetivo &&
-               cadena->cambio.cantidad == cantidad;
+               cadena->cambio.cantidad == cantidad && cadena->cambio.bajas == bajas;
     }
     if (version <= cadena->ultima_propuesta) {
         return false;
@@ -656,7 +690,8 @@ static bool preparar_cambio(Cadena *cadena, uint32_t version, uint32_t base, cha
                                    .objetivo = objetivo, .cantidad = cantidad};
         memset(propuesta.orden, UCHAR_MAX, sizeof propuesta.orden);
         propuesta.orden[cantidad - 1] = (unsigned char)objetivo;
-    } else if (!formar_cambio(cadena, &propuesta, tipo, objetivo) || propuesta.base != base ||
+    } else if (!(tipo == 'M' ? formar_bajas(cadena, &propuesta, bajas)
+                             : formar_cambio(cadena, &propuesta, tipo, objetivo)) || propuesta.base != base ||
                propuesta.cantidad != cantidad ||
                lugar_en(propuesta.orden, cantidad, cadena->propia) == cantidad) {
         return false;
@@ -665,7 +700,7 @@ static bool preparar_cambio(Cadena *cadena, uint32_t version, uint32_t base, cha
     propuesta.base = base;
     char linea[RED_MAX_LINEA];
     snprintf(linea, sizeof linea, "PREPARA %" PRIu32 " %c %s %" PRIu32 "\n",
-             version, tipo, cadena->config->tiendas[objetivo].id, base);
+             version, tipo, destino, base);
     if (!anexar(cadena, linea)) {
         return false;
     }
@@ -687,6 +722,22 @@ static bool atender_cambio(Cadena *cadena, char *campos[CAMPOS], size_t campos_u
                      cadena->version, cadena->config->tiendas[cadena->orden[0]].id,
                      posicion(cadena, par) < cadena->cantidad,
                      cadena->lista && !cadena->cambio.version && !cadena->cerrando);
+        }
+        return true;
+    }
+    if (campos_usados == 4 && strcmp(orden, "BAJAS_ENSAYO") == 0) {
+        uint64_t bajas = leer_bajas(campos[3]);
+        CambioLista propuesta;
+        if (cadena->lista && !cadena->cambio.version && !cadena->encargo.tipo && !cadena->cierre.version &&
+            (!cadena->control_en_curso || cadena->cerrando) &&
+            strncmp(cadena->tienda->direccion, "127.", 4) == 0 &&
+            siguiente(campos[2], UINT32_MAX) == cadena->version &&
+            (!cadena->cerrando || !(bajas & UINT64_C(1))) &&
+            formar_bajas(cadena, &propuesta, bajas) && propuesta.orden[0] == cadena->propia) {
+            cadena->encargo = propuesta;
+            strcpy(respuesta, "CAMBIO_SOLICITADO\n");
+        } else {
+            strcpy(respuesta, "CAMBIO_NO_DISPONIBLE\n");
         }
         return true;
     }
@@ -712,12 +763,12 @@ static bool atender_cambio(Cadena *cadena, char *campos[CAMPOS], size_t campos_u
     CambioLista *cambio = &cadena->cambio;
     int64_t version = siguiente(campos[2], UINT32_MAX);
     if (campos_usados == 7 && strcmp(orden, "PREPARAR") == 0 && version > 0 &&
-        strlen(campos[3]) == 1 && strchr("BRI", campos[3][0])) {
+        strlen(campos[3]) == 1 && strchr("BRIM", campos[3][0])) {
         int64_t cantidad = siguiente(campos[5], CONFIG_MAX_TIENDAS);
         int64_t base = siguiente(campos[6], UINT32_MAX);
         if (cantidad > 0 && base > 0 && preparar_cambio(cadena, (uint32_t)version,
                                            (uint32_t)base, campos[3][0],
-                                           tienda_de(cadena, campos[4]), (size_t)cantidad)) {
+                                           campos[4], (size_t)cantidad)) {
             strcpy(respuesta, "PREPARADA\n");
         }
         return true;
@@ -1233,7 +1284,7 @@ static void atender(Cadena *cadena, char *linea, char *respuesta) {
             }
         }
     } else if (cantidad == 7 && strcmp(campos[0], "RECUP") == 0) {
-        if (cadena->cambio.version && cadena->cambio.tipo != 'B' &&
+        if (cadena->cambio.version && cadena->cambio.tipo != 'B' && cadena->cambio.tipo != 'M' &&
             siguiente(campos[6], UINT32_MAX) == cadena->cambio.version &&
             cadena->verificados == marcados(cadena->cambio.cantidad)) {
             aplicar_remota(cadena, campos, respuesta, cadena->cambio.orden,
@@ -1697,7 +1748,16 @@ static bool leer_registro(Cadena *cadena, char *linea, uint32_t *preparada) {
         version > cadena->version && version > cadena->ultima_propuesta && !*preparada &&
         siguiente(campos[4], UINT32_MAX) >= cadena->version &&
         siguiente(campos[4], UINT32_MAX) < version && strlen(campos[2]) == 1 &&
-        strchr("BRI", campos[2][0]) && tienda_de(cadena, campos[3]) < CONFIG_MAX_TIENDAS) {
+        strchr("BRIM", campos[2][0])) {
+        if (campos[2][0] == 'M') {
+            CambioLista propuesta;
+            if (!formar_bajas(cadena, &propuesta, leer_bajas(campos[3])) ||
+                siguiente(campos[4], UINT32_MAX) != cadena->version) {
+                return false;
+            }
+        } else if (tienda_de(cadena, campos[3]) == CONFIG_MAX_TIENDAS) {
+            return false;
+        }
         *preparada = (uint32_t)version;
         cadena->ultima_propuesta = (uint32_t)version;
         return true;

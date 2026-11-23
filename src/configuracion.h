@@ -11,6 +11,8 @@ enum {
     CONFIG_MAX_ID = 32,
     CONFIG_MAX_RUTA = 512,
     CONFIG_MAX_ARCHIVO = 65536,
+    CONFIG_MAX_SOLICITUDES_EN_VUELO = 7,
+    CONFIG_MAX_COMPRAS_EN_ESPERA = 32,
     CONFIG_SIN_CADENA = -1
 };
 
@@ -21,6 +23,7 @@ typedef struct {
 typedef struct {
     int64_t importe_min_centavos, importe_max_centavos;
     int intervalo_ms;
+    int max_solicitudes_en_vuelo, max_compras_en_espera;
 } ConfigCompras;
 
 typedef struct {

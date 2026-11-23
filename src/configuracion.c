@@ -212,26 +212,29 @@ static bool cerrar_objeto(LectorJson *json, const char *const *campos, size_t ca
 #define CANTIDAD(campos) (sizeof (campos) / sizeof (campos)[0])
 
 static bool leer_compras(LectorJson *json, ConfigCompras *compras) {
-    const char *const campos[] = {"importe_min_centavos", "importe_max_centavos", "intervalo_ms"};
-    int64_t valores[3] = {0};
+    const char *const campos[] = {"importe_min_centavos", "importe_max_centavos", "intervalo_ms",
+                                  "max_solicitudes_en_vuelo", "max_compras_en_espera"};
+    const int64_t maximos[] = {INT64_MAX, INT64_MAX, INT_MAX,
+                               CONFIG_MAX_SOLICITUDES_EN_VUELO, CONFIG_MAX_COMPRAS_EN_ESPERA};
+    int64_t valores[] = {0, 0, 0, 2, 2};
     unsigned vistos = 0;
     if (!tomar(json, '{')) {
         return fallar(json, "se esperaba un objeto de compras");
     }
     do {
         int campo = leer_campo(json, campos, CANTIDAD(campos), &vistos);
-        if (campo < 0 || !leer_entero(json, 1, campo == 2 ? INT_MAX : INT64_MAX, &valores[campo])) {
+        if (campo < 0 || !leer_entero(json, 1, maximos[campo], &valores[campo])) {
             return false;
         }
     } while (tomar(json, ','));
-    if (!cerrar_objeto(json, campos, CANTIDAD(campos), vistos)) {
+    if (!cerrar_objeto(json, campos, 3, vistos)) {
         return false;
     }
     if (valores[0] > valores[1]) {
         json->campo = campos[0];
         return fallar(json, "supera importe_max_centavos");
     }
-    *compras = (ConfigCompras){valores[0], valores[1], (int)valores[2]};
+    *compras = (ConfigCompras){valores[0], valores[1], (int)valores[2], (int)valores[3], (int)valores[4]};
     return true;
 }
 

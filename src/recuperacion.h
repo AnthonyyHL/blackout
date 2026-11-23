@@ -10,6 +10,7 @@ typedef struct {
     char tipo;
     size_t objetivo, cantidad;
     unsigned char orden[CONFIG_MAX_TIENDAS];
+    uint64_t bajas; // Un bit por posición de la vista base en las bajas del ensayo.
 } CambioLista;
 
 // El emisor coordina una sola ronda. Los propietarios validan y registran cada paso.
