@@ -366,6 +366,8 @@ static bool suspender(Cadena *cadena) {
     }
     cadena->cerrando = true;
     if (!anexar(cadena, "CIERRE_EN_CURSO\n")) {
+        fprintf(stderr, "ERROR_HISTORIAL_CIERRE %s: no se pudo guardar CIERRE_EN_CURSO. Compras nuevas bloqueadas.\n",
+                cadena->tienda->id);
         return false;
     }
     printf("CIERRE_EN_CURSO %s\n", cadena->tienda->id);
@@ -414,7 +416,8 @@ static size_t tienda_de(const Cadena *cadena, const char *id) {
 
 /*
  * Anexa una venta validada y actualiza los totales después de escribir la línea
- * completa. Devuelve NULL si la aplica o un mensaje de error si falla.
+ * completa. Devuelve NULL si la aplica. Si falla la marca de cierre posterior,
+ * informa el fallo por separado y mantiene bloqueadas las compras nuevas.
  */
 static const char *registrar(Cadena *cadena, Venta venta) {
     if (cadena->historial_dudoso) {
@@ -438,9 +441,8 @@ static const char *registrar(Cadena *cadena, Venta venta) {
     printf("APLICADA %s %s %" PRId64 " %" PRId64 " propio=%" PRId64 " total=%" PRId64 "\n",
            cadena->tienda->id, origen, venta.secuencia, venta.importe,
            cadena->ingreso_propio, cadena->total);
-    if (cadena->total >= cadena->config->cadenas[cadena->tienda->cadena].meta &&
-        !suspender(cadena)) {
-        return "ERROR_HISTORIAL\n";
+    if (cadena->total >= cadena->config->limite_gubernamental_centavos) {
+        suspender(cadena);
     }
     return NULL;
 }
@@ -450,6 +452,16 @@ static bool clave_valida(const char *clave) {
     return strlen(clave) <= CONFIG_MAX_ID && clave[strspn(clave, permitidos)] == '\0';
 }
 
+static const Venta *venta_por_clave(const Cadena *cadena, const char *clave) {
+    for (size_t i = 0; i < cadena->usadas; ++i) {
+        const Venta *venta = &cadena->ventas[i];
+        if (venta->origen == cadena->propia && strcmp(venta->clave, clave) == 0) {
+            return venta;
+        }
+    }
+    return NULL;
+}
+
 static void compra(Cadena *cadena, char *campos[CAMPOS], char *respuesta) {
     int64_t importe;
     if (!clave_valida(campos[1]) || !numero(campos[2], &importe) || importe == 0) {
@@ -457,16 +469,18 @@ static void compra(Cadena *cadena, char *campos[CAMPOS], char *respuesta) {
         return;
     }
     // Reutiliza la secuencia original si se repiten la clave y el importe.
-    for (size_t i = 0; i < cadena->usadas; ++i) {
-        const Venta *venta = &cadena->ventas[i];
-        if (venta->origen == cadena->propia && strcmp(venta->clave, campos[1]) == 0) {
-            if (venta->importe == importe) {
-                snprintf(respuesta, RED_MAX_LINEA + 1, "ADMITIDA %" PRId64 "\n", venta->secuencia);
-            } else {
-                strcpy(respuesta, "CONFLICTO\n");
-            }
-            return;
+    const Venta *anterior = venta_por_clave(cadena, campos[1]);
+    if (anterior) {
+        if (anterior->importe == importe) {
+            snprintf(respuesta, RED_MAX_LINEA + 1, "ADMITIDA %" PRId64 "\n", anterior->secuencia);
+        } else {
+            strcpy(respuesta, "CONFLICTO\n");
         }
+        return;
+    }
+    if (cadena->historial_dudoso) {
+        strcpy(respuesta, "ERROR_HISTORIAL\n");
+        return;
     }
     if (cadena->cerrando) {
         strcpy(respuesta, "CIERRE_EN_CURSO\n");
@@ -658,6 +672,7 @@ static bool preparar_cambio(Cadena *cadena, uint32_t version, uint32_t base, cha
     cadena->cambio = propuesta;
     cadena->ultima_propuesta = version;
     cadena->verificados = 0;
+    printf("CAMBIO_EN_CURSO %s\n", cadena->tienda->id);
     return true;
 }
 
@@ -1051,7 +1066,7 @@ static bool atender_cierre(Cadena *cadena, char *campos[CAMPOS], size_t n, char 
         int64_t total, cantidad = siguiente(campos[3], cadena->usadas);
         if (cantidad != (int64_t)cadena->usadas || cadena->cotejadas != cadena->usadas ||
             !numero(campos[4], &total) || total != cadena->total ||
-            (!cadena->cierre.version && total < cadena->config->cadenas[cadena->tienda->cadena].meta)) {
+            (!cadena->cierre.version && total < cadena->config->limite_gubernamental_centavos)) {
             strcpy(respuesta, "CONFLICTO\n");
         } else if (cadena->cierre.version) {
             strcpy(respuesta, "PREPARADA\n");
@@ -1133,7 +1148,7 @@ static bool atender_monitor(Cadena *cadena, char *campos[CAMPOS], size_t cantida
         if (numero(campos[3], &indice) && indice > 0 && indice <= ultima) {
             const Venta *venta = cadena->local ? NULL : venta_por_id(cadena, cadena->propia, indice);
             if (cadena->local || venta) {
-                int64_t importe = cadena->local ? cadena->local->ventas[indice - 1] : venta->importe;
+                int64_t importe = cadena->local ? cadena->local->ventas[indice - 1].importe : venta->importe;
                 snprintf(respuesta, RED_MAX_LINEA + 1, "PROPIA %" PRId64 " %" PRId64 "\n", indice, importe);
             }
         }
@@ -1149,9 +1164,25 @@ static void atender(Cadena *cadena, char *linea, char *respuesta) {
         return;
     }
     if (cadena->local) {
+        int64_t importe;
+        if (cantidad == 3 && strcmp(campos[0], "COMPRA") == 0 && numero(campos[2], &importe) && importe > 0) {
+            size_t id;
+            ResultadoTiendaLocal resultado = tienda_local_comprar(cadena->local, campos[1], importe, &id);
+            if (resultado == TIENDA_OK) {
+                snprintf(respuesta, RED_MAX_LINEA + 1, "ADMITIDA %zu\n", id);
+                cadena->salir = cadena->local->cerrada_por_meta;
+            } else if (resultado == TIENDA_CONFLICTO) {
+                strcpy(respuesta, "CONFLICTO\n");
+            } else if (resultado == TIENDA_CERRADA_POR_META) {
+                strcpy(respuesta, "CERRADA_META\n");
+            } else if (resultado == TIENDA_ERROR_ESCRITURA || resultado == TIENDA_HISTORIAL_POR_VERIFICAR) {
+                strcpy(respuesta, "ERROR_HISTORIAL\n");
+            } else if (resultado == TIENDA_DESBORDAMIENTO) {
+                strcpy(respuesta, "DESBORDAMIENTO\n");
+            }
+        }
 #ifdef PRUEBA_MONITOR
         // Las compras controladas ejercitan el mismo propietario durante el ensayo.
-        int64_t importe;
         if (cantidad == 2 && strcmp(campos[0], "COMPRA_LOCAL_PRUEBA") == 0 &&
             numero(campos[1], &importe) && tienda_local_registrar(cadena->local, importe) == TIENDA_OK) {
             strcpy(respuesta, "ADMITIDA\n");
@@ -1734,7 +1765,9 @@ static bool reconstruir(Cadena *cadena, const char *cabecera) {
     uint32_t preparada = 0;
     bool valido = true;
     bool cerrada = false;
+    bool registros = false;
     while (valido && fgets(linea, sizeof linea, archivo)) {
+        registros = true;
         if (strcmp(linea, "CERRADA_META\n") == 0) {
             cerrada = true;
             break;
@@ -1770,6 +1803,19 @@ static bool reconstruir(Cadena *cadena, const char *cabecera) {
     if (cadena->solo_lectura) {
         fprintf(stderr, "El historial no acredita una decisión de cierre.\n");
         return false;
+    }
+    // El historial carece del umbral original. Una ronda pendiente queda para revisión.
+    if (cadena->cerrando) {
+        fprintf(stderr, "Cierre pendiente en el historial. No se puede reanudar. Se conserva el archivo.\n");
+        return false;
+    }
+    if (cadena->total >= cadena->config->limite_gubernamental_centavos) {
+        fprintf(stderr, "El total del historial abierto (%" PRId64 ") alcanza el límite gubernamental (%" PRId64 "). Se conserva el archivo.\n",
+                cadena->total, cadena->config->limite_gubernamental_centavos);
+        return false;
+    }
+    if (!registros) {
+        return true;
     }
     if (preparada || !cadena->version) {
         fprintf(stderr, "Cambio de lista inconcluso o sin vista acordada. Recuperación pendiente.\n");
@@ -1845,10 +1891,16 @@ static int ejecutar(const Configuracion *config, const ConfigTienda *tienda,
     cadena.solo_lectura = solo_lectura;
     TiendaLocal local = TIENDA_LOCAL_INICIAL;
     if (tienda->cadena == CONFIG_SIN_CADENA) {
-        ResultadoTiendaLocal resultado = tienda_local_abrir_consulta(&local, tienda->historial, tienda->meta, false);
+        ResultadoTiendaLocal resultado = tienda_local_abrir_consulta(
+            &local, tienda->historial, config->limite_gubernamental_centavos, false);
         if (resultado != TIENDA_OK || local.cerrada_por_meta) {
-            fprintf(stderr, "%s: %s (%d).\n", tienda->id, local.cerrada_por_meta ? "Tienda cerrada por meta"
-                                        : "No se pudo reconstruir el historial independiente", (int)resultado);
+            if (resultado == TIENDA_META_INCOMPATIBLE) {
+                fprintf(stderr, "%s: el ingreso del historial abierto alcanza el límite gubernamental (%" PRId64 "). Se conserva el archivo.\n",
+                        tienda->id, config->limite_gubernamental_centavos);
+            } else {
+                fprintf(stderr, "%s: %s (%d).\n", tienda->id, local.cerrada_por_meta ? "Tienda cerrada por meta"
+                                            : "No se pudo reconstruir el historial independiente", (int)resultado);
+            }
             if (resultado == TIENDA_OK) {
                 tienda_local_cerrar(&local);
             }
@@ -1907,9 +1959,6 @@ static int ejecutar(const Configuracion *config, const ConfigTienda *tienda,
     } else if (cadena.reiniciada) {
         printf("RECUPERANDO %s propio=%" PRId64 " total=%" PRId64 "\n",
                tienda->id, cadena.ingreso_propio, cadena.total);
-        if (cadena.total >= config->cadenas[tienda->cadena].meta && !suspender(&cadena)) {
-            goto cerrar;
-        }
     } else if (entrada) {
         cadena.incorporando = true;
         canales[EMISOR].salida = (Mensaje){.destino = (size_t)(entrada - config->tiendas),
@@ -1988,7 +2037,8 @@ int tienda_consultar_historial(const Configuracion *config, const ConfigTienda *
     cadena.solo_lectura = cadena.historico = true;
     TiendaLocal local = TIENDA_LOCAL_INICIAL;
     if (tienda->cadena == CONFIG_SIN_CADENA) {
-        ResultadoTiendaLocal resultado = tienda_local_abrir_consulta(&local, tienda->historial, tienda->meta, true);
+        ResultadoTiendaLocal resultado = tienda_local_abrir_consulta(
+            &local, tienda->historial, config->limite_gubernamental_centavos, true);
         if (resultado != TIENDA_OK) {
             fprintf(stderr, "No se pudo leer el historial de %s (%d).\n", tienda->id, (int)resultado);
             return EXIT_FAILURE;
@@ -2005,4 +2055,68 @@ int tienda_consultar_historial(const Configuracion *config, const ConfigTienda *
     free(cadena.ventas);
     free(cadena.cierre.items);
     return resultado;
+}
+
+/* Usa los mismos validadores que el monitor antes de volver a iniciar un hijo. */
+EstadoArchivoTienda tienda_inspeccionar_historial(const Configuracion *config, const ConfigTienda *tienda,
+                                                  const char *clave, int64_t importe, bool *registrada,
+                                                  uint64_t *excluidas) {
+    struct stat datos;
+    if (registrada) {
+        *registrada = false;
+    }
+    if (excluidas) {
+        *excluidas = 0;
+    }
+    if (stat(tienda->historial, &datos) == -1) {
+        return errno == ENOENT ? ARCHIVO_NUEVO : ARCHIVO_BLOQUEADO;
+    }
+    if (!S_ISREG(datos.st_mode)) {
+        return ARCHIVO_BLOQUEADO;
+    }
+    if (!datos.st_size) {
+        return ARCHIVO_NUEVO;
+    }
+    int64_t limite = config->limite_gubernamental_centavos;
+    if (tienda->cadena == CONFIG_SIN_CADENA) {
+        TiendaLocal local = TIENDA_LOCAL_INICIAL;
+        if (tienda_local_abrir_consulta(&local, tienda->historial, limite, true) != TIENDA_OK) {
+            return ARCHIVO_BLOQUEADO;
+        }
+        EstadoArchivoTienda estado = local.cerrada_por_meta ? ARCHIVO_CERRADO
+                                    : local.ingreso_propio >= limite ? ARCHIVO_BLOQUEADO : ARCHIVO_ABIERTO;
+        for (size_t i = 0; registrada && i < local.cantidad; ++i) {
+            if (strcmp(local.ventas[i].clave, clave) == 0) {
+                *registrada = local.ventas[i].importe == importe;
+                break;
+            }
+        }
+        return tienda_local_cerrar(&local) == TIENDA_OK ? estado : ARCHIVO_BLOQUEADO;
+    }
+    Cadena cadena = iniciar_propietario(config, tienda);
+    cadena.solo_lectura = cadena.historico = true;
+    if (abrir_historial(&cadena) == -1) {
+        return ARCHIVO_BLOQUEADO;
+    }
+    EstadoArchivoTienda estado = cadena.definitiva ? ARCHIVO_CERRADO
+                                : cadena.cerrando || cadena.total >= limite ? ARCHIVO_BLOQUEADO
+                                : cadena.version ? ARCHIVO_ABIERTO
+                                : datos.st_size == (off_t)(strlen(cadena.id_cadena) + strlen(tienda->id) +
+                                                          sizeof "HISTORIAL5  \n" - 1)
+                                  ? ARCHIVO_NUEVO : ARCHIVO_BLOQUEADO;
+    if (cadena.reiniciada && cadena.version) {
+        estado = ARCHIVO_BLOQUEADO;
+    }
+    if (registrada) {
+        const Venta *venta = venta_por_clave(&cadena, clave);
+        *registrada = venta && venta->importe == importe;
+    }
+    if (excluidas && estado == ARCHIVO_CERRADO) {
+        for (size_t i = cadena.cierre.participantes; i < cantidad_miembros(&cadena.cierre); ++i) {
+            *excluidas |= UINT64_C(1) << cadena.cierre.miembros[i];
+        }
+    }
+    free(cadena.ventas);
+    free(cadena.cierre.items);
+    return close(cadena.historial) == 0 ? estado : ARCHIVO_BLOQUEADO;
 }

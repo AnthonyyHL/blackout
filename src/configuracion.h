@@ -16,8 +16,17 @@ enum {
 
 typedef struct {
     char id[CONFIG_MAX_ID + 1];
-    int64_t meta;
 } ConfigCadena;
+
+typedef struct {
+    int64_t importe_min_centavos, importe_max_centavos;
+    int intervalo_ms;
+} ConfigCompras;
+
+typedef struct {
+    double probabilidad_caida, evaluar_cada_s, caida_min_s, caida_max_s;
+    bool recuperacion_auto;
+} ConfigInterrupciones;
 
 typedef struct {
     char id[CONFIG_MAX_ID + 1];
@@ -25,7 +34,7 @@ typedef struct {
     uint16_t puerto;
     char historial[CONFIG_MAX_RUTA + 1];
     int cadena;
-    int64_t meta;
+    ConfigCompras compras;
 } ConfigTienda;
 
 typedef struct {
@@ -33,6 +42,10 @@ typedef struct {
     ConfigTienda tiendas[CONFIG_MAX_TIENDAS];
     size_t cantidad_cadenas;
     size_t cantidad_tiendas;
+    int64_t limite_gubernamental_centavos;
+    ConfigInterrupciones interrupciones;
+    unsigned semilla_azar;
+    bool semilla_configurada;
 } Configuracion;
 
 bool configuracion_cargar(const char *ruta, Configuracion *config,

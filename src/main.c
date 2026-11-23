@@ -1,6 +1,7 @@
 #include "configuracion.h"
 #include "monitor.h"
 #include "red.h"
+#include "simulacion.h"
 #include "tienda_cadena.h"
 
 #include <errno.h>
@@ -13,6 +14,14 @@
 #include <unistd.h>
 
 int main(int argc, char *argv[]) {
+    if (argc >= 3 && strcmp(argv[2], "--simular") == 0) {
+        bool reanudar = argc == 4 && strcmp(argv[3], "--reanudar") == 0;
+        if (argc == 3 || reanudar) {
+            return simulacion_ejecutar(argv[1], reanudar);
+        }
+        fprintf(stderr, "Uso: %s config.json --simular [--reanudar]\n", argv[0]);
+        return EXIT_FAILURE;
+    }
     bool modo_cadena = argc >= 4 && strcmp(argv[3], "--cadena") == 0;
     bool solo_cierre = argc == 4 && strcmp(argv[3], "--consultar-cierre") == 0;
     bool modo_independiente = argc == 4 && strcmp(argv[3], "--independiente") == 0;
@@ -32,8 +41,8 @@ int main(int argc, char *argv[]) {
                      : argc == 3 || argc == 5 || (argc == 4 && (modo_cadena || solo_cierre || modo_independiente));
     if (!uso_valido) {
         fprintf(stderr, "Uso: %s config.json ID_TIENDA [ID_PAR IMPORTE_CENTAVOS | --cadena [PAR_INICIAL] | "
-                        "--independiente | --monitor [--ventas] [--historial] | --consultar-cierre]\n",
-                argv[0]);
+                        "--independiente | --monitor [--ventas] [--historial] | --consultar-cierre]\n"
+                        "     %s config.json --simular [--reanudar]\n", argv[0], argv[0]);
         return EXIT_FAILURE;
     }
     Configuracion config;

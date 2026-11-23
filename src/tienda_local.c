@@ -5,29 +5,44 @@
 #include <inttypes.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include <string.h>
 #include <sys/stat.h>
 #include <unistd.h>
 
 enum {
-    TAM_REGISTRO = sizeof "9223372036854775807 1\n",
+    TAM_REGISTRO = sizeof "9223372036854775807 1 K \n" + CONFIG_MAX_ID,
     TAM_BLOQUE = 1024
 };
 
 static bool reservar_venta(TiendaLocal *tienda) {
-    if (!tienda->indexar || tienda->cantidad < tienda->capacidad) {
+    if (tienda->cantidad < tienda->capacidad) {
         return true;
     }
     if (tienda->capacidad > SIZE_MAX / sizeof *tienda->ventas / 2) {
         return false;
     }
     size_t capacidad = tienda->capacidad ? tienda->capacidad * 2 : 16;
-    int64_t *ventas = realloc(tienda->ventas, capacidad * sizeof *ventas);
+    VentaLocal *ventas = realloc(tienda->ventas, capacidad * sizeof *ventas);
     if (!ventas) {
         return false;
     }
     tienda->ventas = ventas;
     tienda->capacidad = capacidad;
     return true;
+}
+
+static bool clave_valida(const char *clave) {
+    return clave[0] && strlen(clave) <= CONFIG_MAX_ID &&
+           clave[strspn(clave, "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_-")] == '\0';
+}
+
+static size_t buscar_clave(const TiendaLocal *tienda, const char *clave) {
+    for (size_t i = 0; i < tienda->cantidad; ++i) {
+        if (strcmp(tienda->ventas[i].clave, clave) == 0) {
+            return i + 1;
+        }
+    }
+    return 0;
 }
 
 static ResultadoTiendaLocal aplicar_registro(TiendaLocal *tienda, const char *registro) {
@@ -39,15 +54,20 @@ static ResultadoTiendaLocal aplicar_registro(TiendaLocal *tienda, const char *re
     errno = 0;
     intmax_t importe = strtoimax(registro, &fin, 10);
     if (errno == ERANGE || importe > INT64_MAX - tienda->ingreso_propio ||
-        fin[0] != ' ' || (fin[1] != '0' && fin[1] != '1') || fin[2] != '\0') {
+        fin[0] != ' ' || (fin[1] != '0' && fin[1] != '1') ||
+        (fin[2] != '\0' && (strncmp(fin + 2, " K ", 3) != 0 || !clave_valida(fin + 5)))) {
+        return TIENDA_HISTORIAL_INVALIDO;
+    }
+    const char *clave = fin[2] ? fin + 5 : "";
+    if (*clave && buscar_clave(tienda, clave)) {
         return TIENDA_HISTORIAL_INVALIDO;
     }
     if (!reservar_venta(tienda)) {
         return TIENDA_SIN_MEMORIA;
     }
-    if (tienda->indexar) {
-        tienda->ventas[tienda->cantidad++] = (int64_t)importe;
-    }
+    VentaLocal *venta = &tienda->ventas[tienda->cantidad++];
+    venta->importe = (int64_t)importe;
+    strcpy(venta->clave, clave);
     tienda->ingreso_propio += (int64_t)importe;
     tienda->cerrada_por_meta = fin[1] == '1';
     return TIENDA_OK;
@@ -89,8 +109,9 @@ static ResultadoTiendaLocal reconstruir_historial(TiendaLocal *tienda) {
     return usados == 0 ? TIENDA_OK : TIENDA_HISTORIAL_INVALIDO;
 }
 
-static ResultadoTiendaLocal abrir(TiendaLocal *tienda, const char *ruta, int64_t meta,
-                                  bool indexar, bool historico) {
+/* Reconstruye los importes por posición. El modo histórico abre solo para lectura. */
+ResultadoTiendaLocal tienda_local_abrir_consulta(TiendaLocal *tienda, const char *ruta,
+                                                 int64_t meta, bool historico) {
     if (tienda == NULL || tienda->fd_historial >= 0 ||
         ruta == NULL || ruta[0] == '\0' || meta <= 0) {
         return TIENDA_PARAMETRO_INVALIDO;
@@ -98,7 +119,6 @@ static ResultadoTiendaLocal abrir(TiendaLocal *tienda, const char *ruta, int64_t
 
     TiendaLocal nueva = TIENDA_LOCAL_INICIAL;
     nueva.meta = meta;
-    nueva.indexar = indexar;
     int opciones = historico ? O_RDONLY | O_NONBLOCK : O_RDWR | O_CREAT | O_APPEND;
     nueva.fd_historial = open(ruta, opciones, 0600);
     if (nueva.fd_historial < 0) {
@@ -128,16 +148,10 @@ static ResultadoTiendaLocal abrir(TiendaLocal *tienda, const char *ruta, int64_t
 }
 
 ResultadoTiendaLocal tienda_local_abrir(TiendaLocal *tienda, const char *ruta, int64_t meta) {
-    return abrir(tienda, ruta, meta, false, false);
+    return tienda_local_abrir_consulta(tienda, ruta, meta, false);
 }
 
-/* Reconstruye los importes por posición. El modo histórico abre solo para lectura. */
-ResultadoTiendaLocal tienda_local_abrir_consulta(TiendaLocal *tienda, const char *ruta,
-                                                 int64_t meta, bool historico) {
-    return abrir(tienda, ruta, meta, true, historico);
-}
-
-ResultadoTiendaLocal tienda_local_registrar(TiendaLocal *tienda, int64_t importe) {
+static ResultadoTiendaLocal registrar(TiendaLocal *tienda, int64_t importe, const char *clave) {
     if (tienda == NULL || tienda->fd_historial < 0) {
         return TIENDA_PARAMETRO_INVALIDO;
     }
@@ -158,8 +172,8 @@ ResultadoTiendaLocal tienda_local_registrar(TiendaLocal *tienda, int64_t importe
     bool alcanza_meta = ingreso_nuevo >= tienda->meta;
     char registro[TAM_REGISTRO];
     // El importe y el cierre pertenecen al mismo registro de venta.
-    int longitud = snprintf(registro, sizeof registro, "%" PRId64 " %d\n",
-                            importe, alcanza_meta);
+    int longitud = snprintf(registro, sizeof registro, "%" PRId64 " %d%s%s\n",
+                            importe, alcanza_meta, *clave ? " K " : "", clave);
     if (longitud < 0 || (size_t)longitud >= sizeof registro) {
         return TIENDA_ERROR_ESCRITURA;
     }
@@ -186,10 +200,30 @@ ResultadoTiendaLocal tienda_local_registrar(TiendaLocal *tienda, int64_t importe
 
     tienda->ingreso_propio = ingreso_nuevo;
     tienda->cerrada_por_meta = alcanza_meta;
-    if (tienda->indexar) {
-        tienda->ventas[tienda->cantidad++] = importe;
-    }
+    VentaLocal *venta = &tienda->ventas[tienda->cantidad++];
+    venta->importe = importe;
+    strcpy(venta->clave, clave);
     return TIENDA_OK;
+}
+
+ResultadoTiendaLocal tienda_local_registrar(TiendaLocal *tienda, int64_t importe) {
+    return registrar(tienda, importe, "");
+}
+
+/* El mismo índice se reconstruye del historial antes de aceptar reintentos por TCP. */
+ResultadoTiendaLocal tienda_local_comprar(TiendaLocal *tienda, const char *clave, int64_t importe, size_t *id) {
+    if (!tienda || tienda->fd_historial < 0 || !clave || !clave_valida(clave) || !id) {
+        return TIENDA_PARAMETRO_INVALIDO;
+    }
+    *id = buscar_clave(tienda, clave);
+    if (*id) {
+        return tienda->ventas[*id - 1].importe == importe ? TIENDA_OK : TIENDA_CONFLICTO;
+    }
+    ResultadoTiendaLocal resultado = registrar(tienda, importe, clave);
+    if (resultado == TIENDA_OK) {
+        *id = tienda->cantidad;
+    }
+    return resultado;
 }
 
 ResultadoTiendaLocal tienda_local_cerrar(TiendaLocal *tienda) {

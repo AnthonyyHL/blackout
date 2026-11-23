@@ -16,4 +16,10 @@ int tienda_cadena_consultar_cierre(const Configuracion *config, const ConfigTien
 int tienda_independiente_ejecutar(const Configuracion *config, const ConfigTienda *tienda);
 int tienda_consultar_historial(const Configuracion *config, const ConfigTienda *tienda, bool ventas);
 
+typedef enum { ARCHIVO_NUEVO, ARCHIVO_ABIERTO, ARCHIVO_CERRADO, ARCHIVO_BLOQUEADO } EstadoArchivoTienda;
+
+EstadoArchivoTienda tienda_inspeccionar_historial(const Configuracion *config, const ConfigTienda *tienda,
+                                                  const char *clave, int64_t importe, bool *registrada,
+                                                  uint64_t *excluidas);
+
 #endif

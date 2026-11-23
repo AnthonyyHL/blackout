@@ -165,6 +165,8 @@ static bool leer_id(LectorJson *json, char id[CONFIG_MAX_ID + 1]) {
            fallar(json, "ID vacío o con caracteres no admitidos");
 }
 
+static const char clave_limite[] = "limite_gubernamental_centavos";
+
 static int leer_campo(LectorJson *json, const char *const *campos, size_t cantidad,
                       unsigned *vistos) {
     char clave[40];
@@ -184,7 +186,12 @@ static int leer_campo(LectorJson *json, const char *const *campos, size_t cantid
             return (int)i;
         }
     }
-    snprintf(json->error, json->capacidad_error, "clave desconocida: %s", clave);
+    if (strcmp(clave, "meta") == 0) {
+        snprintf(json->error, json->capacidad_error,
+                 "Quite las claves 'meta' y declare un solo '%s' en la raíz.", clave_limite);
+    } else {
+        snprintf(json->error, json->capacidad_error, "clave desconocida: %s", clave);
+    }
     return -1;
 }
 
@@ -204,10 +211,33 @@ static bool cerrar_objeto(LectorJson *json, const char *const *campos, size_t ca
 
 #define CANTIDAD(campos) (sizeof (campos) / sizeof (campos)[0])
 
+static bool leer_compras(LectorJson *json, ConfigCompras *compras) {
+    const char *const campos[] = {"importe_min_centavos", "importe_max_centavos", "intervalo_ms"};
+    int64_t valores[3] = {0};
+    unsigned vistos = 0;
+    if (!tomar(json, '{')) {
+        return fallar(json, "se esperaba un objeto de compras");
+    }
+    do {
+        int campo = leer_campo(json, campos, CANTIDAD(campos), &vistos);
+        if (campo < 0 || !leer_entero(json, 1, campo == 2 ? INT_MAX : INT64_MAX, &valores[campo])) {
+            return false;
+        }
+    } while (tomar(json, ','));
+    if (!cerrar_objeto(json, campos, CANTIDAD(campos), vistos)) {
+        return false;
+    }
+    if (valores[0] > valores[1]) {
+        json->campo = campos[0];
+        return fallar(json, "supera importe_max_centavos");
+    }
+    *compras = (ConfigCompras){valores[0], valores[1], (int)valores[2]};
+    return true;
+}
+
 static bool leer_tienda(LectorJson *json, ConfigTienda *tienda, int cadena) {
-    const char *const campos[] = {"id", "historial", "direccion", "puerto", "meta"};
+    const char *const campos[] = {"id", "historial", "direccion", "puerto", "compras"};
     bool suelta = cadena == CONFIG_SIN_CADENA;
-    size_t cantidad = suelta ? CANTIDAD(campos) : CANTIDAD(campos) - 1;
     unsigned vistos = 0;
     tienda->cadena = cadena;
 
@@ -215,7 +245,7 @@ static bool leer_tienda(LectorJson *json, ConfigTienda *tienda, int cadena) {
         return fallar(json, "se esperaba un objeto de tienda");
     }
     do {
-        int campo = leer_campo(json, campos, cantidad, &vistos);
+        int campo = leer_campo(json, campos, CANTIDAD(campos), &vistos);
         int64_t puerto;
         struct in_addr direccion;
         switch (campo) {
@@ -248,7 +278,7 @@ static bool leer_tienda(LectorJson *json, ConfigTienda *tienda, int cadena) {
             tienda->puerto = (uint16_t)puerto;
             break;
         case 4:
-            if (!leer_entero(json, 1, INT64_MAX, &tienda->meta)) {
+            if (!leer_compras(json, &tienda->compras)) {
                 return false;
             }
             break;
@@ -257,10 +287,11 @@ static bool leer_tienda(LectorJson *json, ConfigTienda *tienda, int cadena) {
         }
     } while (tomar(json, ','));
     if (suelta && !tienda->direccion[0] && !tienda->puerto) {
-        // El par completo es opcional para mantener los JSON anteriores.
+        // El par completo es opcional para una independiente sin escucha TCP.
         vistos |= (1u << 2) | (1u << 3);
     }
-    return cerrar_objeto(json, campos, cantidad, vistos);
+    // Fuera de la simulación se puede consultar o atender una tienda sin programar compras.
+    return cerrar_objeto(json, campos, CANTIDAD(campos) - 1, vistos);
 }
 
 static bool leer_tiendas(LectorJson *json, Configuracion *config, int cadena) {
@@ -283,7 +314,7 @@ static bool leer_tiendas(LectorJson *json, Configuracion *config, int cadena) {
 }
 
 static bool leer_cadena(LectorJson *json, Configuracion *config) {
-    const char *const campos[] = {"id", "tiendas", "meta", "detalle_tiendas"};
+    const char *const campos[] = {"id", "tiendas", "detalle_tiendas"};
     unsigned vistos = 0;
     int64_t cantidad = 0;
     size_t inicio = config->cantidad_tiendas;
@@ -305,11 +336,6 @@ static bool leer_cadena(LectorJson *json, Configuracion *config) {
             }
             break;
         case 2:
-            if (!leer_entero(json, 1, INT64_MAX, &cadena->meta)) {
-                return false;
-            }
-            break;
-        case 3:
             if (!leer_tiendas(json, config, (int)config->cantidad_cadenas)) {
                 return false;
             }
@@ -345,11 +371,12 @@ static bool leer_cadenas(LectorJson *json, Configuracion *config) {
     return tomar(json, ']') || fallar(json, "se esperaba ',' o ']'");
 }
 
-static bool leer_interrupciones(LectorJson *json) {
+static bool leer_interrupciones(LectorJson *json, ConfigInterrupciones *interrupciones) {
     const char *const campos[] = {"probabilidad_caida", "evaluar_cada_s",
                                   "caida_min_s", "caida_max_s", "recuperacion_auto"};
     double valores[4] = {0};
     unsigned vistos = 0;
+    bool recuperar = false;
     if (!tomar(json, '{')) {
         return fallar(json, "se esperaba un objeto de interrupciones");
     }
@@ -359,7 +386,8 @@ static bool leer_interrupciones(LectorJson *json) {
             return false;
         }
         if (campo == 4) {
-            if (!literal(json, "true") && !literal(json, "false")) {
+            recuperar = literal(json, "true");
+            if (!recuperar && !literal(json, "false")) {
                 return fallar(json, "se esperaba un booleano");
             }
         } else if (!leer_real(json, &valores[campo])) {
@@ -373,13 +401,17 @@ static bool leer_interrupciones(LectorJson *json) {
         return false;
     }
     json->campo = "caida_min_s";
-    return valores[2] <= valores[3] || fallar(json, "supera caida_max_s");
+    if (valores[2] > valores[3]) {
+        return fallar(json, "supera caida_max_s");
+    }
+    *interrupciones = (ConfigInterrupciones){valores[0], valores[1], valores[2], valores[3], recuperar};
+    return true;
 }
 
 static bool leer_raiz(LectorJson *json, Configuracion *config) {
     const char *const campos[] = {"cadenas", "tiendas_independientes",
                                   "detalle_tiendas_independientes",
-                                  "interrupciones", "semilla_azar"};
+                                  "interrupciones", "semilla_azar", clave_limite};
     unsigned vistos = 0;
     int64_t independientes = 0;
     size_t detalle_independientes = 0;
@@ -407,12 +439,21 @@ static bool leer_raiz(LectorJson *json, Configuracion *config) {
             detalle_independientes = config->cantidad_tiendas - antes;
             break;
         case 3:
-            if (!leer_interrupciones(json)) {
+            if (!leer_interrupciones(json, &config->interrupciones)) {
                 return false;
             }
             break;
         case 4:
-            if (!literal(json, "null") && !leer_entero(json, 0, UINT_MAX, &semilla)) {
+            if (!literal(json, "null")) {
+                if (!leer_entero(json, 0, UINT_MAX, &semilla)) {
+                    return false;
+                }
+                config->semilla_azar = (unsigned)semilla;
+                config->semilla_configurada = true;
+            }
+            break;
+        case 5:
+            if (!leer_entero(json, 1, INT64_MAX, &config->limite_gubernamental_centavos)) {
                 return false;
             }
             break;
