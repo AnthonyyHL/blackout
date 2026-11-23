@@ -2,6 +2,7 @@
 #define TIENDA_CADENA_H
 
 #include "configuracion.h"
+#include "cierre.h"
 
 /*
  * Ejecuta la tienda hasta que se solicita salir o hay un error. Devuelve
@@ -24,5 +25,16 @@ typedef enum { ARCHIVO_NUEVO, ARCHIVO_ABIERTO, ARCHIVO_CERRADO, ARCHIVO_BLOQUEAD
 EstadoArchivoTienda tienda_inspeccionar_historial(const Configuracion *config, const ConfigTienda *tienda,
                                                   const char *clave, int64_t importe, bool *registrada,
                                                   uint64_t *excluidas);
+
+typedef struct {
+    bool disponible, cerrada, cierre_pendiente, recuperacion_pendiente;
+    size_t ventas_propias, ventas_sin_confirmacion;
+    int64_t ingreso_propio, total_conocido;
+    EvidenciaCierre certificado;
+} ResumenHistorial;
+
+// Lee con los mismos validadores de recuperación. El llamador libera certificado.items.
+ResumenHistorial tienda_resumir_historial(const Configuracion *config, const ConfigTienda *tienda);
+bool tienda_certificados_coinciden(const EvidenciaCierre *a, const EvidenciaCierre *b);
 
 #endif

@@ -51,7 +51,7 @@ build/monitor.o: src/monitor.c src/monitor.h src/red.h src/configuracion.h | bui
 build/tienda_cadena.o: src/tienda_cadena.c src/tienda_cadena.h src/cierre.h src/recuperacion.h src/red.h src/configuracion.h src/monitor.h src/tienda_local.h | build
 	$(CC) $(CPPFLAGS) $(CFLAGS) -pthread -c $< -o $@
 
-build/simulacion.o: src/simulacion.c src/simulacion.h src/red.h src/configuracion.h src/tienda_cadena.h | build
+build/simulacion.o: src/simulacion.c src/simulacion.h src/red.h src/configuracion.h src/tienda_cadena.h src/cierre.h src/recuperacion.h | build
 	$(CC) $(CPPFLAGS) $(CFLAGS) -c $< -o $@
 
 bin/blackout: src/main.c src/configuracion.h src/tienda_cadena.h src/monitor.h src/simulacion.h $(RED) $(CADENA) $(MONITOR) $(SIMULACION) | bin

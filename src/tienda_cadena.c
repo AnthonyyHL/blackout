@@ -903,18 +903,18 @@ static bool leer_item(Cadena *cadena, char **campos, ItemCierre *dato) {
            numero(campos[2], &dato->importe) && dato->importe > 0;
 }
 
-static bool conoce_item(const EvidenciaCierre *cierre, const ItemCierre *dato) {
+static const ItemCierre *buscar_item(const EvidenciaCierre *cierre, const ItemCierre *dato) {
     for (size_t i = 0; i < cierre->items_leidos; ++i) {
         if (cierre->items[i].origen == dato->origen &&
             cierre->items[i].secuencia == dato->secuencia) {
-            return true;
+            return &cierre->items[i];
         }
     }
-    return false;
+    return NULL;
 }
 
 static bool agregar_item(EvidenciaCierre *cierre, ItemCierre dato) {
-    if (cierre->items_leidos == cierre->cantidad || conoce_item(cierre, &dato)) {
+    if (cierre->items_leidos == cierre->cantidad || buscar_item(cierre, &dato)) {
         return false;
     }
     cierre->items[cierre->items_leidos++] = dato;
@@ -976,7 +976,7 @@ static bool guardar_importacion(Cadena *cadena) {
     for (size_t i = 0; i < cadena->usadas; ++i) {
         const Venta *venta = &cadena->ventas[i];
         ItemCierre dato = {venta->origen, venta->secuencia, venta->importe};
-        if (venta->origen == cadena->propia && !conoce_item(borrador, &dato)) {
+        if (venta->origen == cadena->propia && !buscar_item(borrador, &dato)) {
             snprintf(linea, sizeof linea, "NO_INCLUIDA %s %" PRId64 " %" PRId64 "\n",
                      cadena->tienda->id, venta->secuencia, venta->importe);
             if (!anexar(cadena, linea)) {
@@ -1765,7 +1765,7 @@ static bool leer_registro(Cadena *cadena, char *linea, uint32_t *preparada) {
                 cadena->cierre.items_leidos == cadena->cierre.cantidad) {
                 const Venta *venta = venta_por_id(cadena, dato.origen, dato.secuencia);
                 return dato.origen == cadena->propia && venta && venta->importe == dato.importe &&
-                       !conoce_item(&cadena->cierre, &dato);
+                       !buscar_item(&cadena->cierre, &dato);
             }
         }
         return false;
@@ -2164,9 +2164,9 @@ int tienda_consultar_historial(const Configuracion *config, const ConfigTienda *
  * informa si la clave e importe coinciden y qué tiendas quedaron fuera del cierre.
  * Devuelve ARCHIVO_BLOQUEADO cuando la evidencia no permite un arranque seguro.
  */
-EstadoArchivoTienda tienda_inspeccionar_historial(const Configuracion *config, const ConfigTienda *tienda,
-                                                  const char *clave, int64_t importe, bool *registrada,
-                                                  uint64_t *excluidas) {
+static EstadoArchivoTienda inspeccionar_historial(const Configuracion *config, const ConfigTienda *tienda,
+                                                 const char *clave, int64_t importe, bool *registrada,
+                                                 uint64_t *excluidas, ResumenHistorial *resumen) {
     struct stat datos;
     if (registrada) {
         *registrada = false;
@@ -2180,7 +2180,8 @@ EstadoArchivoTienda tienda_inspeccionar_historial(const Configuracion *config, c
     if (!S_ISREG(datos.st_mode)) {
         return ARCHIVO_BLOQUEADO;
     }
-    if (!datos.st_size) {
+    // Un historial vacío de una independiente permite informar cero ventas.
+    if (!datos.st_size && (!resumen || tienda->cadena != CONFIG_SIN_CADENA)) {
         return ARCHIVO_NUEVO;
     }
     int64_t limite = config->limite_gubernamental_centavos;
@@ -2197,7 +2198,17 @@ EstadoArchivoTienda tienda_inspeccionar_historial(const Configuracion *config, c
                 break;
             }
         }
-        return tienda_local_cerrar(&local) == TIENDA_OK ? estado : ARCHIVO_BLOQUEADO;
+        if (resumen) {
+            *resumen = (ResumenHistorial){.disponible = true, .cerrada = local.cerrada_por_meta,
+                                        .ventas_propias = local.cantidad, .ingreso_propio = local.ingreso_propio};
+        }
+        if (tienda_local_cerrar(&local) != TIENDA_OK) {
+            if (resumen) {
+                resumen->disponible = false;
+            }
+            return ARCHIVO_BLOQUEADO;
+        }
+        return estado;
     }
     Cadena cadena = iniciar_propietario(config, tienda);
     cadena.solo_lectura = cadena.historico = true;
@@ -2222,7 +2233,64 @@ EstadoArchivoTienda tienda_inspeccionar_historial(const Configuracion *config, c
             *excluidas |= UINT64_C(1) << cadena.cierre.miembros[i];
         }
     }
+    if (resumen) {
+        *resumen = (ResumenHistorial){.disponible = true, .cerrada = cadena.definitiva,
+            .cierre_pendiente = cadena.cerrando && !cadena.definitiva,
+            .recuperacion_pendiente = cadena.reiniciada, .ventas_propias = (size_t)cadena.secuencia,
+            .ingreso_propio = cadena.ingreso_propio, .total_conocido = cadena.total};
+        if (!cadena.definitiva && cadena.version && !cadena.reiniciada) {
+            resumen->ventas_sin_confirmacion = pendientes_propias(&cadena);
+        }
+        if (cadena.definitiva && cadena.cierre.version) {
+            resumen->certificado = cadena.cierre;
+            if (cadena.cierre.items) {
+                cadena.cierre.items = NULL;
+            } else {
+                ItemCierre *items = malloc(cadena.cierre.cantidad * sizeof *items);
+                resumen->certificado.items = items;
+                if (items) {
+                    for (size_t i = 0; i < cadena.cierre.cantidad; ++i) {
+                        items[i] = item(&cadena, i);
+                    }
+                    resumen->certificado.items_leidos = cadena.cierre.cantidad;
+                }
+            }
+        }
+    }
     free(cadena.ventas);
     free(cadena.cierre.items);
-    return close(cadena.historial) == 0 ? estado : ARCHIVO_BLOQUEADO;
+    if (close(cadena.historial) == -1) {
+        if (resumen) {
+            free(resumen->certificado.items);
+            *resumen = (ResumenHistorial){0};
+        }
+        return ARCHIVO_BLOQUEADO;
+    }
+    return estado;
+}
+
+EstadoArchivoTienda tienda_inspeccionar_historial(const Configuracion *config, const ConfigTienda *tienda,
+                                                  const char *clave, int64_t importe, bool *registrada,
+                                                  uint64_t *excluidas) {
+    return inspeccionar_historial(config, tienda, clave, importe, registrada, excluidas, NULL);
+}
+
+ResumenHistorial tienda_resumir_historial(const Configuracion *config, const ConfigTienda *tienda) {
+    ResumenHistorial resumen = {0};
+    inspeccionar_historial(config, tienda, NULL, 0, NULL, NULL, &resumen);
+    return resumen;
+}
+
+// El orden de registro puede diferir entre tiendas. Se cotejan identificadores e importes.
+bool tienda_certificados_coinciden(const EvidenciaCierre *a, const EvidenciaCierre *b) {
+    if (!misma_cabecera(a, b)) {
+        return false;
+    }
+    for (size_t i = 0; i < a->cantidad; ++i) {
+        const ItemCierre *otra = buscar_item(b, &a->items[i]);
+        if (!otra || otra->importe != a->items[i].importe) {
+            return false;
+        }
+    }
+    return true;
 }

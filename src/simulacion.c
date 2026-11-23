@@ -1314,6 +1314,249 @@ static void informar_pendientes(const Simulacion *sim) {
     }
 }
 
+// Importes del reporte en centavos, con agrupación de miles.
+static void importe_reporte(FILE *archivo, int64_t centavos) {
+    char entero[24];
+    snprintf(entero, sizeof entero, "%" PRId64, centavos / 100);
+    size_t largo = strlen(entero);
+    for (size_t i = 0; i < largo; ++i) {
+        if (i && (largo - i) % 3 == 0) {
+            fputc('.', archivo);
+        }
+        fputc(entero[i], archivo);
+    }
+    fprintf(archivo, ",%02" PRId64, centavos % 100);
+}
+
+static void fila_reporte(FILE *archivo, const ConfigTienda *t, const Hijo *hijo,
+                         const ResumenHistorial *r, bool excluida) {
+    const char *estado = r->cerrada ? "Cerrada por meta"
+                       : excluida ? "Excluida del cierre de cadena"
+                       : !r->disponible ? "Historial no disponible"
+                       : r->cierre_pendiente ? "Cierre pendiente"
+                       : hijo->cortada ? "Interrumpida por corte"
+                       : r->recuperacion_pendiente ? "Recuperación pendiente"
+                       : "Sin cierre acreditado";
+    fprintf(archivo, "| `%s` | %s | ", t->id, estado);
+    if (r->disponible) {
+        fprintf(archivo, "%zu | ", r->ventas_propias);
+        importe_reporte(archivo, r->ingreso_propio);
+    } else {
+        fputs("No disponible | No disponible", archivo);
+    }
+    if (t->cadena != CONFIG_SIN_CADENA) {
+        fputs(" | ", archivo);
+        if (r->disponible) {
+            importe_reporte(archivo, r->total_conocido);
+        } else {
+            fputs("No disponible", archivo);
+        }
+    }
+    fputs(" |\n", archivo);
+}
+
+static void cadena_reporte(FILE *archivo, const Simulacion *sim, int grupo,
+                           const ResumenHistorial resumen[CONFIG_MAX_TIENDAS]) {
+    const EvidenciaCierre *certificado = NULL;
+    bool discrepancia = false, incompleto = false;
+    size_t copias = 0;
+    for (size_t i = 0; i < sim->config.cantidad_tiendas; ++i) {
+        const EvidenciaCierre *c = &resumen[i].certificado;
+        if (tienda(sim, i)->cadena != grupo || !c->version) {
+            continue;
+        }
+        if (!c->items) {
+            incompleto = true;
+        } else if (!certificado) {
+            certificado = c;
+        } else if (!tienda_certificados_coinciden(certificado, c)) {
+            discrepancia = true;
+        }
+        copias += c->items != NULL;
+    }
+    uint64_t fuera = 0;
+    if (certificado && !discrepancia && !incompleto) {
+        for (size_t i = certificado->participantes; i < certificado->participantes + certificado->excluidas; ++i) {
+            fuera |= UINT64_C(1) << certificado->miembros[i];
+        }
+    }
+
+    fprintf(archivo, "\n## Cadena `%s`\n\n", sim->config.cadenas[grupo].id);
+    fputs("| Tienda | Estado | Ventas propias | Ingreso propio | Total conocido |\n"
+          "| --- | --- | ---: | ---: | ---: |\n", archivo);
+    for (size_t i = 0; i < sim->config.cantidad_tiendas; ++i) {
+        if (tienda(sim, i)->cadena == grupo) {
+            fila_reporte(archivo, tienda(sim, i), &sim->hijos[i], &resumen[i],
+                         (fuera & (UINT64_C(1) << i)) != 0);
+        }
+    }
+    if (discrepancia || incompleto || !certificado) {
+        fputs("\n**Total certificado, ventas conciliadas, participantes y excluidas:** No disponible. ", archivo);
+        fputs(discrepancia ? "Discrepancia entre los certificados leídos.\n"
+              : incompleto ? "No se pudieron comparar todos los certificados leídos.\n"
+              : "No hay un certificado definitivo disponible.\n", archivo);
+        return;
+    }
+    fputs("\n- **Total certificado:** ", archivo);
+    importe_reporte(archivo, certificado->total);
+    fprintf(archivo, "\n- **Ventas conciliadas:** %zu\n- **Participantes:** ", certificado->cantidad);
+    for (size_t i = 0; i < certificado->participantes; ++i) {
+        fprintf(archivo, "%s`%s`", i ? ", " : "", tienda(sim, certificado->miembros[i])->id);
+    }
+    fputs("\n- **Excluidas:** ", archivo);
+    if (!certificado->excluidas) {
+        fputs("Ninguna", archivo);
+    }
+    for (size_t i = 0; i < certificado->excluidas; ++i) {
+        fprintf(archivo, "%s`%s`", i ? ", " : "",
+                tienda(sim, certificado->miembros[certificado->participantes + i])->id);
+    }
+    fprintf(archivo, "\n- **Copias disponibles del certificado:** %zu\n", copias);
+}
+
+static bool mismo_archivo(const struct stat *a, const struct stat *b) {
+    return a->st_dev == b->st_dev && a->st_ino == b->st_ino;
+}
+
+static bool datos_directorio(char *ruta, struct stat *datos) {
+    char *barra = strrchr(ruta, '/');
+    if (!barra || barra == ruta) {
+        return stat(barra ? "/" : ".", datos) == 0;
+    }
+    *barra = '\0';
+    bool leido = stat(ruta, datos) == 0;
+    *barra = '/';
+    return leido;
+}
+
+// También protege rutas de historial aún ausentes bajo el mismo directorio.
+static bool destino_reporte_seguro(const Simulacion *sim, char *ruta, const struct stat *diario) {
+    struct stat destino, otro, padre;
+    bool existe = lstat(ruta, &destino) == 0;
+    if (existe ? !S_ISREG(destino.st_mode) : errno != ENOENT) {
+        return false;
+    }
+    if ((existe && (mismo_archivo(&destino, diario) ||
+                    (stat(sim->ruta, &otro) == 0 && mismo_archivo(&destino, &otro)))) ||
+        !datos_directorio(ruta, &padre)) {
+        return false;
+    }
+    const char *nombre = strrchr(ruta, '/');
+    nombre = nombre ? nombre + 1 : ruta;
+    for (size_t i = 0; i < sim->config.cantidad_tiendas; ++i) {
+        char historial[CONFIG_MAX_RUTA + 1];
+        strcpy(historial, tienda(sim, i)->historial);
+        if (existe && stat(historial, &otro) == 0 && mismo_archivo(&destino, &otro)) {
+            return false;
+        }
+        if (strcmp(nombre, strrchr(historial, '/') + 1) == 0 &&
+            datos_directorio(historial, &otro) && mismo_archivo(&padre, &otro)) {
+            return false;
+        }
+    }
+    return true;
+}
+
+static void generar_reporte(const Simulacion *sim, int resultado, bool error, bool lectura_segura,
+                           const struct stat *diario, const ResumenHistorial resumen[CONFIG_MAX_TIENDAS]) {
+    size_t largo = strlen(sim->ruta) + sizeof ".resultados.md";
+    char *ruta = malloc(largo);
+    char *temporal = malloc(largo + sizeof ".XXXXXX");
+    if (!ruta || !temporal) {
+        fprintf(stderr, "No se pudo preparar la ruta del reporte.\n");
+        free(ruta);
+        free(temporal);
+        return;
+    }
+    snprintf(ruta, largo, "%s.resultados.md", sim->ruta);
+    snprintf(temporal, largo + sizeof ".XXXXXX", "%s.XXXXXX", ruta);
+    int fd = mkstemp(temporal);
+    FILE *archivo = fd == -1 ? NULL : fdopen(fd, "w");
+    if (!archivo) {
+        fprintf(stderr, "No se pudo abrir el reporte %s: %s\n", ruta, strerror(errno));
+        if (fd != -1) {
+            close(fd);
+            unlink(temporal);
+        }
+        goto salir;
+    }
+    char fecha[32] = "No disponible";
+    time_t ahora = time(NULL);
+    struct tm utc;
+    if (ahora != (time_t)-1 && gmtime_r(&ahora, &utc)) {
+        strftime(fecha, sizeof fecha, "%Y-%m-%d %H:%M:%S UTC", &utc);
+    }
+    fprintf(archivo, "# Resultados de BlackOut\n\n**Fecha de generación:** %s\n\n**Resultado:** %s\n\n",
+            fecha, resultado == EXIT_SUCCESS ? "Cierres acreditados por el ensayo."
+                 : resultado == 130 ? "Parcial. Detención solicitada."
+                 : error ? "Parcial. El ensayo terminó con un error."
+                         : "Parcial. El ensayo terminó con cierres pendientes.");
+    fputs("**Límite gubernamental:** ", archivo);
+    importe_reporte(archivo, sim->config.limite_gubernamental_centavos);
+    fputs("\n\nEl ingreso propio corresponde a la tienda. El total conocido es su copia del total de cadena. "
+          "El total certificado se muestra una vez por cadena.\n", archivo);
+    if (!lectura_segura) {
+        fputs("\nLa lectura de historiales quedó pendiente porque faltaban procesos por recoger.\n", archivo);
+    }
+    for (size_t i = 0; i < sim->config.cantidad_cadenas; ++i) {
+        cadena_reporte(archivo, sim, (int)i, resumen);
+    }
+    bool independientes = false;
+    for (size_t i = 0; i < sim->config.cantidad_tiendas; ++i) {
+        if (tienda(sim, i)->cadena == CONFIG_SIN_CADENA) {
+            if (!independientes) {
+                fputs("\n## Tiendas independientes\n\n| Tienda | Estado | Ventas propias | Ingreso propio |\n"
+                      "| --- | --- | ---: | ---: |\n", archivo);
+                independientes = true;
+            }
+            fila_reporte(archivo, tienda(sim, i), &sim->hijos[i], &resumen[i], false);
+        }
+    }
+    fputs("\n## Compras pendientes\n\n", archivo);
+    bool hay_pendientes = false;
+    for (size_t i = 0; i < sim->config.cantidad_tiendas; ++i) {
+        for (size_t j = 0; j < CAPACIDAD; ++j) {
+            const Compra *compra = &sim->compras[i][j];
+            if (compra->secuencia) {
+                fprintf(archivo, "- `%s`, `sim_%" PRId64 "`, importe ", tienda(sim, i)->id, compra->secuencia);
+                importe_reporte(archivo, compra->importe);
+                fputs(compra->intentada ? " (resultado sin confirmar).\n" : " (sin envío registrado).\n", archivo);
+                hay_pendientes = true;
+            }
+        }
+    }
+    if (!hay_pendientes) {
+        fputs("No quedaron compras pendientes en el lanzador.\n", archivo);
+    }
+    bool confirmaciones = false;
+    for (size_t i = 0; i < sim->config.cantidad_tiendas; ++i) {
+        if (resumen[i].ventas_sin_confirmacion) {
+            if (!confirmaciones) {
+                fputs("\n## Ventas sin confirmación completa\n\n"
+                      "Según la última lista guardada en el historial de cada tienda.\n\n", archivo);
+                confirmaciones = true;
+            }
+            fprintf(archivo, "- `%s`: %zu\n", tienda(sim, i)->id, resumen[i].ventas_sin_confirmacion);
+        }
+    }
+    bool escrito = !ferror(archivo);
+    if (fclose(archivo) == EOF || !escrito) {
+        fprintf(stderr, "No se pudo escribir el reporte %s.\n", ruta);
+    } else if (!diario || !destino_reporte_seguro(sim, ruta, diario)) {
+        fprintf(stderr, "Se conservó %s: destino inseguro para el reporte.\n", ruta);
+    } else if (rename(temporal, ruta) == -1) {
+        fprintf(stderr, "No se pudo publicar el reporte %s: %s\n", ruta, strerror(errno));
+    } else {
+        printf("REPORTE_RESULTADOS %s\n", ruta);
+        goto salir;
+    }
+    unlink(temporal);
+
+salir:
+    free(temporal);
+    free(ruta);
+}
+
 int simulacion_ejecutar(const char *ruta, bool reanudar) {
     setvbuf(stdout, NULL, _IOLBF, 0);
     Simulacion sim = {.ruta = ruta};
@@ -1355,13 +1598,24 @@ int simulacion_ejecutar(const char *ruta, bool reanudar) {
     }
     limpiar(&sim, detener && !sim.error);
     informar_pendientes(&sim);
-    if (fclose(sim.diario) == EOF || sim.error) {
-        return EXIT_FAILURE;
+    bool detencion_solicitada = detener;
+    // Lee los historiales mientras el lanzador conserva el bloqueo del diario.
+    bool lectura_segura = !quedan_hijos(&sim);
+    ResumenHistorial resumen[CONFIG_MAX_TIENDAS] = {0};
+    for (size_t i = 0; lectura_segura && i < sim.config.cantidad_tiendas; ++i) {
+        resumen[i] = tienda_resumir_historial(&sim.config, tienda(&sim, i));
     }
-    if (detener) {
+    struct stat diario;
+    bool diario_identificado = fstat(fileno(sim.diario), &diario) == 0;
+    bool error_final = fclose(sim.diario) == EOF || sim.error;
+    // 130 sigue la convención 128 + SIGINT (2) y también se usa para SIGTERM.
+    int resultado = error_final ? EXIT_FAILURE : detencion_solicitada ? 130 : exito ? EXIT_SUCCESS : EXIT_FAILURE;
+    if (resultado == 130) {
         puts("SIMULACION_DETENIDA");
-        // 130 sigue la convención 128 + SIGINT (2) y también se usa para SIGTERM.
-        return 130;
     }
-    return exito ? EXIT_SUCCESS : EXIT_FAILURE;
+    generar_reporte(&sim, resultado, error_final, lectura_segura, diario_identificado ? &diario : NULL, resumen);
+    for (size_t i = 0; i < sim.config.cantidad_tiendas; ++i) {
+        free(resumen[i].certificado.items);
+    }
+    return resultado;
 }

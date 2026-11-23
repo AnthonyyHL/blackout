@@ -29,6 +29,12 @@ El ejemplo arranca dos cadenas y una tienda independiente. El lanzador genera co
 
 `SIMULACION_CIERRES_ACREDITADOS` indica que el ensayo acreditó los cierres. Si se agotan las posibilidades de avance o vence el plazo sin progreso, el lanzador informa las tiendas pendientes. Un ensayo que termina con pendientes carece de un cierre acreditado para esas tiendas.
 
+## Reporte de resultados
+
+Al terminar el ensayo aparece `REPORTE_RESULTADOS` con la ruta del Markdown. Con el JSON de ejemplo se guarda en `config.json.resultados.md`, junto a `config.json.simulacion`. Se puede leer con `cat config.json.resultados.md` o con la vista previa de Markdown del editor.
+
+El reporte muestra las ventas e ingresos propios por tienda y un solo total certificado por cadena. Si el ensayo se interrumpe o termina con cierres pendientes, el reporte indica que es parcial. También muestra las compras pendientes, los datos no disponibles y las discrepancias entre certificados. Reanudar puede actualizar el mismo Markdown. El informe abre los historiales en solo lectura y un fallo del reporte se informa por separado.
+
 ## Configuración
 
 Edita `config.json` antes de arrancar. Mantén las cantidades de tiendas en concordancia con sus listas. Cada tienda necesita un ID, un punto TCP de loopback y una ruta de historial propios. Los puntos TCP y las rutas deben ser distintos entre tiendas. Las rutas relativas se resuelven desde el directorio del JSON.
