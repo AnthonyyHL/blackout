@@ -4,6 +4,7 @@
 #include <errno.h>
 #include <fcntl.h>
 #include <poll.h>
+#include <stdarg.h>
 #include <stdio.h>
 #include <string.h>
 #include <sys/socket.h>
@@ -315,4 +316,15 @@ bool red_intercambiar_hasta(const ConfigTienda *destino, const char *linea, char
     }
     close(fd);
     return exito;
+}
+
+bool red_pedir(const ConfigTienda *par, int fin, int64_t vence, char *respuesta,
+               const char *formato, ...) {
+    char linea[RED_MAX_LINEA + 1], error[128];
+    va_list argumentos;
+    va_start(argumentos, formato);
+    int largo = vsnprintf(linea, sizeof linea, formato, argumentos);
+    va_end(argumentos);
+    return largo > 0 && largo <= RED_MAX_LINEA && !red_fin_solicitado(fin) &&
+           red_intercambiar_hasta(par, linea, respuesta, error, sizeof error, vence);
 }

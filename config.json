@@ -1,0 +1,34 @@
+{
+  "limite_gubernamental_centavos": 100000,
+  "cadenas": [
+    {
+      "id": "cadena_1",
+      "tiendas": 3,
+      "detalle_tiendas": [
+        { "id": "A", "direccion": "127.0.0.1", "puerto": 5101, "historial": "datos/a.txt", "compras": { "importe_min_centavos": 1000, "importe_max_centavos": 3500, "intervalo_ms": 700, "max_solicitudes_en_vuelo": 2, "max_compras_en_espera": 2 } },
+        { "id": "B", "direccion": "127.0.0.1", "puerto": 5102, "historial": "datos/b.txt", "compras": { "importe_min_centavos": 1000, "importe_max_centavos": 3500, "intervalo_ms": 770, "max_solicitudes_en_vuelo": 2, "max_compras_en_espera": 2 } },
+        { "id": "C", "direccion": "127.0.0.1", "puerto": 5103, "historial": "datos/c.txt", "compras": { "importe_min_centavos": 1000, "importe_max_centavos": 3500, "intervalo_ms": 850, "max_solicitudes_en_vuelo": 2, "max_compras_en_espera": 2 } }
+      ]
+    },
+    {
+      "id": "cadena_2",
+      "tiendas": 2,
+      "detalle_tiendas": [
+        { "id": "D", "direccion": "127.0.0.1", "puerto": 5201, "historial": "datos/d.txt", "compras": { "importe_min_centavos": 1000, "importe_max_centavos": 3500, "intervalo_ms": 720, "max_solicitudes_en_vuelo": 2, "max_compras_en_espera": 2 } },
+        { "id": "E", "direccion": "127.0.0.1", "puerto": 5202, "historial": "datos/e.txt", "compras": { "importe_min_centavos": 1000, "importe_max_centavos": 3500, "intervalo_ms": 800, "max_solicitudes_en_vuelo": 2, "max_compras_en_espera": 2 } }
+      ]
+    }
+  ],
+  "tiendas_independientes": 1,
+  "detalle_tiendas_independientes": [
+    { "id": "F", "historial": "datos/f.txt", "compras": { "importe_min_centavos": 1000, "importe_max_centavos": 3500, "intervalo_ms": 600, "max_solicitudes_en_vuelo": 2, "max_compras_en_espera": 2 }, "direccion": "127.0.0.1", "puerto": 5301 }
+  ],
+  "interrupciones": {
+    "probabilidad_caida": 0.15,
+    "evaluar_cada_s": 10,
+    "caida_min_s": 5,
+    "caida_max_s": 20,
+    "recuperacion_auto": true
+  },
+  "semilla_azar": 42
+}

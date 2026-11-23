@@ -33,4 +33,8 @@ bool red_intercambiar(const ConfigTienda *destino, const char *linea, char *resp
 bool red_intercambiar_hasta(const ConfigTienda *destino, const char *linea, char *respuesta,
                             char *error, size_t capacidad_error, int64_t limite);
 
+// Forma la solicitud y la envía antes del plazo si el canal de trabajo sigue abierto.
+bool red_pedir(const ConfigTienda *par, int fin, int64_t vence, char *respuesta,
+               const char *formato, ...);
+
 #endif

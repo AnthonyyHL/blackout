@@ -186,13 +186,17 @@ static bool numero(const char *campo, int64_t *valor) {
     return true;
 }
 
-static size_t posicion(const Cadena *cadena, size_t tienda) {
-    for (size_t i = 0; i < cadena->cantidad; ++i) {
-        if (cadena->orden[i] == tienda) {
+static size_t lugar_en(const unsigned char *orden, size_t cantidad, size_t tienda) {
+    for (size_t i = 0; i < cantidad; ++i) {
+        if (orden[i] == tienda) {
             return i;
         }
     }
-    return cadena->cantidad;
+    return cantidad;
+}
+
+static size_t posicion(const Cadena *cadena, size_t tienda) {
+    return lugar_en(cadena->orden, cadena->cantidad, tienda);
 }
 
 static int64_t siguiente(const char *campo, size_t maximo) {
@@ -552,15 +556,6 @@ static void confirmacion(char *texto, const Cadena *cadena, const Venta *venta, 
         snprintf(texto, RED_MAX_LINEA + 1, "HECHA %s %s %" PRId64 " %" PRId64 " %zu %" PRIu32 "\n",
                  cadena->id_cadena, id, venta->secuencia, venta->importe, turno, version);
     }
-}
-
-static size_t lugar_en(const unsigned char *orden, size_t cantidad, size_t tienda) {
-    for (size_t i = 0; i < cantidad; ++i) {
-        if (orden[i] == tienda) {
-            return i;
-        }
-    }
-    return cantidad;
 }
 
 static uint64_t marcados(size_t cantidad) {

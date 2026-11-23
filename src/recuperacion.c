@@ -3,7 +3,6 @@
 
 #include <errno.h>
 #include <inttypes.h>
-#include <stdarg.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -17,17 +16,6 @@ static bool leer_positivo(const char *texto, int64_t *valor) {
     }
     *valor = (int64_t)numero;
     return true;
-}
-
-static bool pedir(const ConfigTienda *par, int fin, int64_t vence, char *respuesta,
-                  const char *formato, ...) {
-    char linea[RED_MAX_LINEA + 1], error[128];
-    va_list argumentos;
-    va_start(argumentos, formato);
-    int largo = vsnprintf(linea, sizeof linea, formato, argumentos);
-    va_end(argumentos);
-    return largo > 0 && largo <= RED_MAX_LINEA && !red_fin_solicitado(fin) &&
-           red_intercambiar_hasta(par, linea, respuesta, error, sizeof error, vence);
 }
 
 static size_t lugar(const CambioLista *cambio, size_t tienda) {
@@ -49,8 +37,8 @@ static size_t lugar(const CambioLista *cambio, size_t tienda) {
 static int tiene_venta(const ConfigTienda *par, const char *cadena, const char *origen,
                        int64_t secuencia, int64_t importe, uint32_t version, int fin, int64_t vence) {
     char respuesta[RED_MAX_LINEA + 1], esperada[64];
-    if (!pedir(par, fin, vence, respuesta, "TIENE %s %s %" PRId64 " %" PRIu32 "\n",
-               cadena, origen, secuencia, version)) {
+    if (!red_pedir(par, fin, vence, respuesta, "TIENE %s %s %" PRId64 " %" PRIu32 "\n",
+                   cadena, origen, secuencia, version)) {
         return -1;
     }
     if (strcmp(respuesta, "FALTA\n") == 0) {
@@ -98,9 +86,9 @@ static bool reproducir(const Configuracion *config, const char *cadena, const Ca
                      "HECHA %s %s %" PRId64 " %" PRId64 " %zu %" PRIu32 "\n",
                      cadena, id_origen, secuencia, importe, i, cambio->version);
         }
-        if (!pedir(par, fin, vence, respuesta,
-                   "RECUP %s %s %" PRId64 " %" PRId64 " %zu %" PRIu32 "\n",
-                   cadena, id_origen, secuencia, importe, previa, cambio->version) ||
+        if (!red_pedir(par, fin, vence, respuesta,
+                       "RECUP %s %s %" PRId64 " %" PRId64 " %zu %" PRIu32 "\n",
+                       cadena, id_origen, secuencia, importe, previa, cambio->version) ||
             strcmp(respuesta, esperada) != 0) {
             return false;
         }
@@ -123,8 +111,8 @@ bool recuperacion_sincronizar(const Configuracion *config, const char *cadena,
             char secuencia_texto[20], importe_texto[20];
             int64_t secuencia, importe;
             char fin_linea;
-            if (!pedir(par, fin, vence, respuesta, "FICHA %s %zu %" PRIu32 "\n",
-                       cadena, fila, cambio->version)) {
+            if (!red_pedir(par, fin, vence, respuesta, "FICHA %s %zu %" PRIu32 "\n",
+                           cadena, fila, cambio->version)) {
                 return false;
             }
             if (strcmp(respuesta, "FIN\n") == 0) {
@@ -172,12 +160,12 @@ bool recuperacion_acordar(const Configuracion *config, const ConfigTienda *propi
     bool listo = true;
     for (size_t i = 0; i < cambio->cantidad && listo; ++i) {
         const ConfigTienda *par = &config->tiendas[cambio->orden[i]];
-        listo = pedir(par, fin, vence, respuesta, "PREPARAR %s %" PRIu32 " %c %s %zu %" PRIu32 "\n",
-                      cadena, cambio->version, cambio->tipo, objetivo, cambio->cantidad, cambio->base) &&
+        listo = red_pedir(par, fin, vence, respuesta, "PREPARAR %s %" PRIu32 " %c %s %zu %" PRIu32 "\n",
+                          cadena, cambio->version, cambio->tipo, objetivo, cambio->cantidad, cambio->base) &&
                 strcmp(respuesta, "PREPARADA\n") == 0;
         for (size_t j = 0; j < cambio->cantidad && listo; ++j) {
-            listo = pedir(par, fin, vence, respuesta, "MIEMBRO %s %" PRIu32 " %zu %s\n",
-                          cadena, cambio->version, j, config->tiendas[cambio->orden[j]].id) &&
+            listo = red_pedir(par, fin, vence, respuesta, "MIEMBRO %s %" PRIu32 " %zu %s\n",
+                              cadena, cambio->version, j, config->tiendas[cambio->orden[j]].id) &&
                     strcmp(respuesta, "VERIFICADO\n") == 0;
         }
     }
@@ -188,8 +176,8 @@ bool recuperacion_acordar(const Configuracion *config, const ConfigTienda *propi
     if (!listo || red_reloj_ms() >= vence) {
         // Registrar la cancelación evita que un PREPARAR tardío vuelva a abrir la ronda.
         for (size_t i = 0; i < cambio->cantidad; ++i) {
-            pedir(&config->tiendas[cambio->orden[i]], fin, vence + RECUPERACION_MS, respuesta,
-                  "CANCELAR %s %" PRIu32 "\n", cadena, cambio->version);
+            red_pedir(&config->tiendas[cambio->orden[i]], fin, vence + RECUPERACION_MS, respuesta,
+                      "CANCELAR %s %" PRIu32 "\n", cadena, cambio->version);
         }
         return false;
     }
@@ -197,8 +185,8 @@ bool recuperacion_acordar(const Configuracion *config, const ConfigTienda *propi
     bool instalada = true;
     for (size_t i = 0; i < cambio->cantidad; ++i) {
         const ConfigTienda *par = &config->tiendas[cambio->orden[i]];
-        if (!pedir(par, fin, vence + RECUPERACION_MS, respuesta,
-                   "INSTALAR %s %" PRIu32 "\n", cadena, cambio->version) ||
+        if (!red_pedir(par, fin, vence + RECUPERACION_MS, respuesta,
+                       "INSTALAR %s %" PRIu32 "\n", cadena, cambio->version) ||
             strcmp(respuesta, "INSTALADA\n") != 0) {
             instalada = false;
         }
@@ -235,7 +223,7 @@ bool recuperacion_buscar(const Configuracion *config, const ConfigTienda *propia
         int64_t numero_version;
         char version_texto[11], dentro[2], activa[2];
         char primera[CONFIG_MAX_ID + 1], lf;
-        if (!pedir(par, fin, vence, respuesta, "VIGENTE %s %s\n", cadena, propia->id) ||
+        if (!red_pedir(par, fin, vence, respuesta, "VIGENTE %s %s\n", cadena, propia->id) ||
             sscanf(respuesta, "VIGENTE %10[0-9] %32s %1[01] %1[01]%c",
                    version_texto, primera, dentro, activa, &lf) != 5 || lf != '\n' ||
             !leer_positivo(version_texto, &numero_version) || numero_version > UINT32_MAX) {
@@ -259,8 +247,8 @@ bool recuperacion_buscar(const Configuracion *config, const ConfigTienda *propia
         }
     }
     if (entrada) {
-        return pedir(entrada, fin, vence, respuesta, "%s %s %s\n",
-                    incluida ? "REANUDAR" : "RETORNO", cadena, propia->id);
+        return red_pedir(entrada, fin, vence, respuesta, "%s %s %s\n",
+                        incluida ? "REANUDAR" : "RETORNO", cadena, propia->id);
     }
     if (mayor == guardada->version && guardada->orden[0] == yo &&
         presentes == guardada->cantidad) {
