@@ -3,10 +3,8 @@
 #include <arpa/inet.h>
 #include <errno.h>
 #include <fcntl.h>
-#include <inttypes.h>
 #include <poll.h>
 #include <stdio.h>
-#include <stdlib.h>
 #include <string.h>
 #include <sys/socket.h>
 #include <time.h>
@@ -26,10 +24,6 @@ typedef enum {
     LINEA_FIN,
     LINEA_ERROR
 } ResultadoLinea;
-
-static const char tipo_prueba[] = "PRUEBA_VENTA ";
-static const char recibido[] = "RECIBIDO\n";
-static const char rechazado[] = "ERROR\n";
 
 int64_t red_reloj_ms(void) {
     struct timespec ahora;
@@ -204,34 +198,6 @@ static int conectar(const ConfigTienda *destino, int64_t limite) {
     return fd;
 }
 
-static bool trama_valida(const ServidorRed *servidor, char *linea) {
-    size_t largo_tipo = sizeof tipo_prueba - 1;
-    if (strncmp(linea, tipo_prueba, largo_tipo) != 0) {
-        return false;
-    }
-    char *cadena = linea + largo_tipo;
-    char *origen = strchr(cadena, ' ');
-    if (!origen) {
-        return false;
-    }
-    *origen++ = '\0';
-    char *importe = strchr(origen, ' ');
-    if (!importe) {
-        return false;
-    }
-    *importe++ = '\0';
-    const ConfigTienda *par = configuracion_buscar(servidor->config, origen);
-    if (strcmp(cadena, servidor->config->cadenas[servidor->tienda->cadena].id) != 0 ||
-        !par || par == servidor->tienda || par->cadena != servidor->tienda->cadena ||
-        *importe < '1' || *importe > '9') {
-        return false;
-    }
-    errno = 0;
-    char *fin;
-    intmax_t centavos = strtoimax(importe, &fin, 10);
-    return errno != ERANGE && centavos <= INT64_MAX && strcmp(fin, "\n") == 0;
-}
-
 bool red_fin_solicitado(int fd) {
     struct pollfd entrada = {.fd = fd, .events = POLLIN};
     return poll(&entrada, 1, 0) > 0 && (entrada.revents & (POLLHUP | POLLERR | POLLNVAL));
@@ -240,7 +206,7 @@ bool red_fin_solicitado(int fd) {
 static void atender(int fd, const ServidorRed *servidor) {
     LectorRed lector = {0};
     char linea[RED_MAX_LINEA + 1];
-    while (!servidor->atender_local || !red_fin_solicitado(servidor->fin)) {
+    while (!red_fin_solicitado(servidor->fin)) {
         // Los bytes de la siguiente línea ya recibidos conservan su hora de llegada.
         int64_t vence = lector.siguiente < lector.fin
                            ? lector.recibido_en + RED_PLAZO_MS : nuevo_plazo();
@@ -248,17 +214,10 @@ static void atender(int fd, const ServidorRed *servidor) {
         if (resultado == LINEA_FIN || resultado == LINEA_ERROR) {
             return;
         }
-        char local[RED_MAX_LINEA + 1];
-        const char *respuesta = rechazado;
-        if (resultado == LINEA_COMPLETA) {
-            if (strncmp(linea, tipo_prueba, sizeof tipo_prueba - 1) == 0) {
-                respuesta = trama_valida(servidor, linea) ? recibido : rechazado;
-            } else if (*linea && servidor->atender_local) {
-                if (!servidor->atender_local(servidor->canal, linea, local)) {
-                    return;
-                }
-                respuesta = local;
-            }
+        char respuesta[RED_MAX_LINEA + 1] = "ERROR\n";
+        if (resultado == LINEA_COMPLETA && *linea &&
+            !servidor->atender_local(servidor->canal, linea, respuesta)) {
+            return;
         }
         if (!escribir_linea(fd, respuesta, strlen(respuesta), nuevo_plazo()) ||
             resultado != LINEA_COMPLETA) {
@@ -267,25 +226,23 @@ static void atender(int fd, const ServidorRed *servidor) {
     }
 }
 
-void *red_recibir(void *contexto) {
-    const ServidorRed *servidor = contexto;
+void red_recibir(const ServidorRed *servidor) {
     for (;;) {
-        if (servidor->atender_local) {
-            struct pollfd entradas[] = {
-                {.fd = servidor->escucha, .events = POLLIN},
-                {.fd = servidor->fin, .events = POLLIN}
-            };
-            int estado = poll(entradas, 2, -1);
-            if (estado < 0 && errno == EINTR) {
-                continue;
-            }
-            if (estado < 0 || entradas[1].revents || !(entradas[0].revents & POLLIN)) {
-                return NULL;
-            }
+        struct pollfd entradas[] = {
+            {.fd = servidor->escucha, .events = POLLIN},
+            {.fd = servidor->fin, .events = POLLIN}
+        };
+        int estado = poll(entradas, 2, -1);
+        if (estado < 0 && errno == EINTR) {
+            continue;
+        }
+        if (estado < 0 || entradas[1].revents || !(entradas[0].revents & POLLIN)) {
+            return;
         }
         int fd = accept(servidor->escucha, NULL, NULL);
         if (fd == -1) {
-            if (errno == EINTR || errno == ECONNABORTED) {
+            // Si el otro receptor ya aceptó la conexión, se vuelve a esperar.
+            if (errno == EINTR || errno == ECONNABORTED || errno == EAGAIN || errno == EWOULDBLOCK) {
                 continue;
             }
             if (errno == EMFILE || errno == ENFILE || errno == ENOBUFS || errno == ENOMEM) {
@@ -294,16 +251,8 @@ void *red_recibir(void *contexto) {
                 nanosleep(&pausa, NULL);
                 continue;
             }
-            if (servidor->atender_local) {
-                // Si el otro receptor ya aceptó la conexión, se vuelve a esperar.
-                if (errno == EAGAIN || errno == EWOULDBLOCK) {
-                    continue;
-                }
-                perror("accept");
-                return NULL;
-            }
             perror("accept");
-            exit(EXIT_FAILURE);
+            return;
         }
         if (red_no_bloqueante(fd)) {
             atender(fd, servidor);
@@ -349,29 +298,4 @@ bool red_intercambiar_hasta(const ConfigTienda *destino, const char *linea, char
     }
     close(fd);
     return exito;
-}
-
-bool red_enviar_prueba(const Configuracion *config, const ConfigTienda *origen,
-                      const ConfigTienda *destino, int64_t importe,
-                      char *error, size_t capacidad_error) {
-    if (origen == destino || origen->cadena == CONFIG_SIN_CADENA ||
-        origen->cadena != destino->cadena || importe <= 0) {
-        snprintf(error, capacidad_error, "destino o importe inválido para %s", origen->id);
-        return false;
-    }
-    char linea[RED_MAX_LINEA + 1], respuesta[RED_MAX_LINEA + 1];
-    int longitud = snprintf(linea, sizeof linea, "%s%s %s %" PRId64 "\n", tipo_prueba,
-                             config->cadenas[origen->cadena].id, origen->id, importe);
-    if (longitud < 0 || longitud > RED_MAX_LINEA) {
-        snprintf(error, capacidad_error, "mensaje demasiado largo");
-        return false;
-    }
-    if (!red_intercambiar(destino, linea, respuesta, error, capacidad_error)) {
-        return false;
-    }
-    if (strcmp(respuesta, recibido) != 0) {
-        snprintf(error, capacidad_error, "respuesta inválida o incompleta de %s", destino->id);
-        return false;
-    }
-    return true;
 }

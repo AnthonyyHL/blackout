@@ -1232,14 +1232,6 @@ static void atender(Cadena *cadena, char *linea, char *respuesta) {
                 strcpy(respuesta, "DESBORDAMIENTO\n");
             }
         }
-#ifdef PRUEBA_MONITOR
-        // Las compras controladas ejercitan el mismo propietario durante el ensayo.
-        if (cantidad == 2 && strcmp(campos[0], "COMPRA_LOCAL_PRUEBA") == 0 &&
-            numero(campos[1], &importe) && tienda_local_registrar(cadena->local, importe) == TIENDA_OK) {
-            strcpy(respuesta, "ADMITIDA\n");
-            cadena->salir = cadena->local->cerrada_por_meta;
-        }
-#endif
         return;
     }
     if (cantidad == 3 && strcmp(campos[0], "COMPRA") == 0) {

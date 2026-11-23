@@ -19,7 +19,7 @@ int red_escuchar(const ConfigTienda *tienda);
 bool red_no_bloqueante(int fd);
 int64_t red_reloj_ms(void);
 bool red_fin_solicitado(int fd);
-void *red_recibir(void *contexto);
+void red_recibir(const ServidorRed *servidor);
 /*
  * Envía una línea terminada en LF y espera otra con plazos acotados.
  * Devuelve true si recibe una línea completa en respuesta, que admite
@@ -29,8 +29,5 @@ bool red_intercambiar(const ConfigTienda *destino, const char *linea, char *resp
                       char *error, size_t capacidad_error);
 bool red_intercambiar_hasta(const ConfigTienda *destino, const char *linea, char *respuesta,
                             char *error, size_t capacidad_error, int64_t limite);
-bool red_enviar_prueba(const Configuracion *config, const ConfigTienda *origen,
-                      const ConfigTienda *destino, int64_t importe,
-                      char *error, size_t capacidad_error);
 
 #endif
