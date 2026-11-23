@@ -9,6 +9,7 @@
 #include <string.h>
 
 int main(int argc, char *argv[]) {
+    // El lanzador carga el escenario completo. Los demás modos seleccionan una tienda.
     if (argc >= 3 && strcmp(argv[2], "--simular") == 0) {
         bool reanudar = argc == 4 && strcmp(argv[3], "--reanudar") == 0;
         if (argc == 3 || reanudar) {
@@ -65,7 +66,7 @@ int main(int argc, char *argv[]) {
         }
     }
 
-    // Un cierre remoto se procesa como error de I/O en el hilo que envía.
+    // Ignorar SIGPIPE permite tratar un cierre remoto como error de escritura.
     struct sigaction accion = {.sa_handler = SIG_IGN};
     if (sigemptyset(&accion.sa_mask) == -1 || sigaction(SIGPIPE, &accion, NULL) == -1) {
         perror("SIGPIPE");

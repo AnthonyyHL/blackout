@@ -45,7 +45,10 @@ static size_t buscar_clave(const TiendaLocal *tienda, const char *clave) {
     return 0;
 }
 
+// Reconstrucción del historial
+
 static ResultadoTiendaLocal aplicar_registro(TiendaLocal *tienda, const char *registro) {
+    // Una venta posterior a la marca definitiva invalida el historial.
     if (tienda->cerrada_por_meta || registro[0] < '1' || registro[0] > '9') {
         return TIENDA_HISTORIAL_INVALIDO;
     }
@@ -58,6 +61,7 @@ static ResultadoTiendaLocal aplicar_registro(TiendaLocal *tienda, const char *re
         (fin[2] != '\0' && (strncmp(fin + 2, " K ", 3) != 0 || !clave_valida(fin + 5)))) {
         return TIENDA_HISTORIAL_INVALIDO;
     }
+    // Las ventas antiguas sin clave también conservan su posición.
     const char *clave = fin[2] ? fin + 5 : "";
     if (*clave && buscar_clave(tienda, clave)) {
         return TIENDA_HISTORIAL_INVALIDO;
@@ -73,6 +77,11 @@ static ResultadoTiendaLocal aplicar_registro(TiendaLocal *tienda, const char *re
     return TIENDA_OK;
 }
 
+/*
+ * Reconstruye ventas y cierre en una instancia que todavía no atiende compras.
+ * Devuelve TIENDA_OK si todos los registros terminan en salto de línea y son válidos.
+ * Una lectura fallida o una última línea incompleta impide usar esa instancia.
+ */
 static ResultadoTiendaLocal reconstruir_historial(TiendaLocal *tienda) {
     char bloque[TAM_BLOQUE];
     char registro[TAM_REGISTRO];
@@ -109,7 +118,11 @@ static ResultadoTiendaLocal reconstruir_historial(TiendaLocal *tienda) {
     return usados == 0 ? TIENDA_OK : TIENDA_HISTORIAL_INVALIDO;
 }
 
-/* Reconstruye los importes por posición. El modo histórico abre solo para lectura. */
+/*
+ * Abre un archivo regular y reconstruye la tienda por orden de registro.
+ * En modo histórico abre solo para lectura. Devuelve TIENDA_OK y entrega
+ * el estado al llamador si el historial es válido para el modo solicitado.
+ */
 ResultadoTiendaLocal tienda_local_abrir_consulta(TiendaLocal *tienda, const char *ruta,
                                                  int64_t meta, bool historico) {
     if (tienda == NULL || tienda->fd_historial >= 0 ||
@@ -132,7 +145,7 @@ ResultadoTiendaLocal tienda_local_abrir_consulta(TiendaLocal *tienda, const char
     }
 
     ResultadoTiendaLocal resultado = reconstruir_historial(&nueva);
-    // La marca histórica mantiene el cierre aunque cambie la meta de prueba.
+    // La meta nueva solo se comprueba si el historial sigue abierto.
     if (resultado == TIENDA_OK && !historico && !nueva.cerrada_por_meta &&
         nueva.ingreso_propio >= meta) {
         resultado = TIENDA_META_INCOMPATIBLE;
@@ -151,6 +164,13 @@ ResultadoTiendaLocal tienda_local_abrir(TiendaLocal *tienda, const char *ruta, i
     return tienda_local_abrir_consulta(tienda, ruta, meta, false);
 }
 
+// Admisión de compras
+
+/*
+ * Anexa el registro de una venta y actualiza el ingreso propio.
+ * Devuelve TIENDA_OK cuando la escritura está completa. Si la escritura
+ * falla, conserva el ingreso anterior y bloquea los registros nuevos.
+ */
 static ResultadoTiendaLocal registrar(TiendaLocal *tienda, int64_t importe, const char *clave) {
     if (tienda == NULL || tienda->fd_historial < 0) {
         return TIENDA_PARAMETRO_INVALIDO;
@@ -191,7 +211,7 @@ static ResultadoTiendaLocal registrar(TiendaLocal *tienda, int64_t importe, cons
             continue;
         }
         if (cantidad <= 0) {
-            // Mantiene el total previo y evita anexar detrás de un registro parcial.
+            // El archivo puede contener un registro parcial.
             tienda->historial_por_verificar = true;
             return TIENDA_ERROR_ESCRITURA;
         }
@@ -210,12 +230,16 @@ ResultadoTiendaLocal tienda_local_registrar(TiendaLocal *tienda, int64_t importe
     return registrar(tienda, importe, "");
 }
 
-/* El mismo índice se reconstruye del historial antes de aceptar reintentos por TCP. */
+/*
+ * Devuelve TIENDA_OK y el ID de la venta nueva o ya registrada con esa clave.
+ * Si el importe difiere del guardado para esa clave, devuelve TIENDA_CONFLICTO.
+ */
 ResultadoTiendaLocal tienda_local_comprar(TiendaLocal *tienda, const char *clave, int64_t importe, size_t *id) {
     if (!tienda || tienda->fd_historial < 0 || !clave || !clave_valida(clave) || !id) {
         return TIENDA_PARAMETRO_INVALIDO;
     }
     *id = buscar_clave(tienda, clave);
+    // Una venta ya registrada se puede confirmar incluso después del cierre.
     if (*id) {
         return tienda->ventas[*id - 1].importe == importe ? TIENDA_OK : TIENDA_CONFLICTO;
     }

@@ -28,7 +28,7 @@ typedef struct {
     size_t cantidad;
     unsigned char orden[CONFIG_MAX_TIENDAS];
     char linea[RED_MAX_LINEA + 1];
-    char confirmacion[RED_MAX_LINEA + 1];
+    char confirmacion[RED_MAX_LINEA + 1]; // Respuesta que confirma la aplicación en el par.
     CambioLista cambio;
     enum TrabajoCierre cierre;
     bool inicio;
@@ -39,6 +39,7 @@ typedef struct {
 _Static_assert(sizeof(Mensaje) <= _POSIX_PIPE_BUF, "Un mensaje debe caber en un pipe");
 
 typedef struct {
+    // Cada trabajador tiene un pipe por sentido. El propietario conserva el avance.
     int desde_hilo[2];
     int hacia_hilo[2];
     Mensaje entrada, salida;
@@ -56,9 +57,9 @@ typedef struct {
     size_t origen;
     int64_t secuencia, importe;
     char clave[CONFIG_MAX_ID + 1];
-    uint64_t confirmadas;  // Un bit por identidad de config, independiente del orden actual.
-    int64_t reintentar;    // Instante monotónico en ms. Cero permite intentar de inmediato.
-    bool cotejada;
+    uint64_t confirmadas; // Un bit por tienda del JSON cuando confirma la aplicación.
+    int64_t reintentar;   // Próximo intento en el reloj monotónico. Cero permite intentarlo ya.
+    bool cotejada; // El cierre ya comprobó esta venta y su importe.
 } Venta;
 
 /*
@@ -71,32 +72,34 @@ typedef struct {
     const char *id_cadena;
     TiendaLocal *local;
     int historial;
-    bool historial_dudoso, historico;
-    // Cada posición de incorporación contiene un índice de config->tiendas.
+    bool historial_dudoso, historico; // Escritura fallida / consulta de archivo.
+    // La lista ordenada guarda índices de config->tiendas.
     unsigned char orden[CONFIG_MAX_TIENDAS];
     size_t cantidad, cantidad_configurada, propia;
     bool lista;
-    uint32_t version, ultima_propuesta;
-    CambioLista cambio, encargo;
-    uint64_t verificados;
+    uint32_t version, ultima_propuesta; // Cero en version indica que aún no hay lista acordada.
+    CambioLista cambio, encargo; // Propuesta preparada y propuesta por enviar al emisor.
+    uint64_t verificados; // Un bit por posición comprobada de la lista propuesta.
     bool reiniciada, control_en_curso;
     int64_t buscar_desde;
     int64_t secuencia, ingreso_propio, total;
     Venta *ventas;
-    // proxima es el punto de partida de la búsqueda circular. en_envio guarda
-    // el índice de la venta en curso o SIZE_MAX si el emisor está libre.
+    /*
+     * proxima indica dónde retomar la búsqueda circular de ventas pendientes.
+     * en_envio guarda el índice de la venta en curso o SIZE_MAX si no hay una.
+     */
     size_t usadas, capacidad, proxima, en_envio;
     bool incorporando;
     bool cerrando, conciliando, definitiva, solo_lectura, salir, informo_pendiente;
     size_t cotejadas;
-    EvidenciaCierre cierre, borrador;
+    EvidenciaCierre cierre, borrador; // Cierre preparado o guardado y copia por comprobar.
 } Cadena;
 
 static size_t turno_pendiente(const Cadena *cadena, const Venta *venta, size_t *previa);
 
 static volatile sig_atomic_t avisar_fin = -1;
 
-// El byte de aviso despierta al propietario mientras espera en poll.
+// SIGINT y SIGTERM despiertan al propietario con un byte en el pipe.
 static void solicitar_fin(int senal) {
     (void)senal;
     int anterior = errno;
@@ -126,6 +129,10 @@ static bool transferir(int fd, Mensaje *mensaje, bool escribir) {
     return true;
 }
 
+/*
+ * Entrega una copia de la solicitud al propietario y espera su respuesta.
+ * Devuelve false si el canal se cierra o el registro no se puede transferir.
+ */
 static bool pasar_al_propietario(void *contexto, const char *linea, char *respuesta) {
     Trabajador *hilo = contexto;
     Mensaje mensaje = {0};
@@ -236,9 +243,9 @@ static bool consultar_posicion(Trabajador *hilo, const ConfigTienda *par, size_t
 // Incorporación y envíos TCP
 
 /*
- * Pide el alta a los integrantes anteriores y solicita sellar la lista si
- * es la última incorporación. Devuelve true si los pares aceptan y deja
- * el orden acordado en mensaje.
+ * Pide a las tiendas anteriores que acepten el alta. Si la lista alcanza
+ * el tamaño configurado, les pide guardarla como lista inicial.
+ * Devuelve true si las demás aceptan y deja el orden en el mensaje.
  */
 static bool incorporarse(Trabajador *hilo, Mensaje *mensaje) {
     const Configuracion *config = hilo->red.config;
@@ -302,7 +309,8 @@ static bool incorporarse(Trabajador *hilo, Mensaje *mensaje) {
 
 /*
  * Atiende encargos de red y devuelve el resultado al propietario por el pipe.
- * Un envío de venta solo se confirma si coincide la respuesta de aplicación.
+ * Un envío de venta se da por confirmado si la respuesta de aplicación coincide
+ * con la venta enviada y con la posición esperada de la tienda que responde.
  * Devuelve NULL cuando se cierra el canal o falla la transferencia.
  */
 static void *emitir(void *contexto) {
@@ -351,6 +359,10 @@ static void anunciar_lista(const Cadena *cadena) {
 
 // Registro y aplicación de ventas
 
+/*
+ * Anexa un registro completo y devuelve true si se escriben todos sus bytes.
+ * Si falla, bloquea escrituras posteriores porque la última línea puede quedar incompleta.
+ */
 static bool anexar(Cadena *cadena, const char *linea) {
     if (cadena->historial_dudoso) {
         return false;
@@ -362,7 +374,6 @@ static bool anexar(Cadena *cadena, const char *linea) {
         if (n > 0) {
             usados += (size_t)n;
         } else if (n == 0 || errno != EINTR) {
-            // Si falla la escritura, el archivo puede quedar con una línea incompleta.
             cadena->historial_dudoso = true;
             return false;
         }
@@ -374,6 +385,7 @@ static bool suspender(Cadena *cadena) {
     if (cadena->cerrando) {
         return !cadena->historial_dudoso;
     }
+    // La admisión se detiene aunque falle la escritura de la marca.
     cadena->cerrando = true;
     if (!anexar(cadena, "CIERRE_EN_CURSO\n")) {
         fprintf(stderr, "ERROR_HISTORIAL_CIERRE %s: no se pudo guardar CIERRE_EN_CURSO. Compras nuevas bloqueadas.\n",
@@ -472,13 +484,17 @@ static const Venta *venta_por_clave(const Cadena *cadena, const char *clave) {
     return NULL;
 }
 
+/*
+ * Responde a una compra propia con su secuencia o con el motivo de rechazo.
+ * Una compra nueva se admite después de anexar la venta al historial.
+ */
 static void compra(Cadena *cadena, char *campos[CAMPOS], char *respuesta) {
     int64_t importe;
     if (!clave_valida(campos[1]) || !numero(campos[2], &importe) || importe == 0) {
         strcpy(respuesta, "ERROR\n");
         return;
     }
-    // Reutiliza la secuencia original si se repiten la clave y el importe.
+    // Un reintento idéntico recupera la secuencia incluso con la admisión suspendida.
     const Venta *anterior = venta_por_clave(cadena, campos[1]);
     if (anterior) {
         if (anterior->importe == importe) {
@@ -515,8 +531,9 @@ static void compra(Cadena *cadena, char *campos[CAMPOS], char *respuesta) {
 }
 
 /*
- * Devuelve la posición de quien aplica justo antes del destinatario. El
- * primero sigue al origen. El resto salta la posición del origen en la lista.
+ * Devuelve quién debe haber aplicado la venta antes del destinatario.
+ * La primera tienda sigue al origen. Las demás toman el lugar anterior
+ * de la lista y saltan el del origen, que ya aplicó primero.
  */
 static size_t predecesora(size_t turno, size_t origen) {
     if (turno == 0 || (turno == 1 && origen == 0)) {
@@ -547,13 +564,14 @@ static size_t lugar_en(const unsigned char *orden, size_t cantidad, size_t tiend
 }
 
 static uint64_t marcados(size_t cantidad) {
+    // El caso de 64 posiciones evita desplazar un entero por todo su ancho.
     return cantidad == 64 ? UINT64_MAX : (UINT64_C(1) << cantidad) - 1;
 }
 
 /*
- * Aplica la venta remota si le toca y escribe la respuesta en el búfer.
- * Si ya se aplicó el mismo ID e importe, confirma sin volver a registrar ni sumar.
- * Si cambia el importe para ese ID, responde CONFLICTO.
+ * Comprueba que la venta llegue con la posición previa esperada.
+ * Si la venta ya se aplicó con ese identificador e importe, repite la
+ * confirmación. Si el importe cambió, responde CONFLICTO.
  */
 static void aplicar_remota(Cadena *cadena, char *campos[CAMPOS], char *respuesta,
                            const unsigned char *orden, size_t cantidad, uint32_t version) {
@@ -602,6 +620,7 @@ static bool instalar(Cadena *cadena, const CambioLista *cambio) {
                            " %s", cadena->config->tiendas[cambio->orden[i]].id);
     }
     snprintf(linea + usados, sizeof linea - (size_t)usados, "\n");
+    // La nueva lista se usa solo después de escribir su registro.
     if (!anexar(cadena, linea)) {
         return false;
     }
@@ -644,7 +663,10 @@ static bool formar_cambio(const Cadena *cadena, CambioLista *cambio, char tipo, 
            (tipo != 'R' || cambio->orden[cambio->cantidad - 1] == objetivo);
 }
 
-/* Valida las bajas sobre una sola vista y conserva el orden de las supervivientes. */
+/*
+ * Propone retirar varias tiendas de la lista actual sin cambiar el orden de las demás.
+ * Devuelve false si las posiciones de baja son inválidas o se retira a esta tienda.
+ */
 static bool formar_bajas(const Cadena *cadena, CambioLista *cambio, uint64_t bajas) {
     if (!bajas || !cadena->version || cadena->version == UINT32_MAX ||
         cadena->ultima_propuesta == UINT32_MAX) {
@@ -688,6 +710,7 @@ static bool preparar_cambio(Cadena *cadena, uint32_t version, uint32_t base, cha
     if (tipo == 'R' && objetivo == cadena->propia && cadena->reiniciada) {
         propuesta = (CambioLista){.version = version, .tipo = tipo,
                                    .objetivo = objetivo, .cantidad = cantidad};
+        // La tienda que retorna ocupa el final. Los demás lugares llegan por MIEMBRO.
         memset(propuesta.orden, UCHAR_MAX, sizeof propuesta.orden);
         propuesta.orden[cantidad - 1] = (unsigned char)objetivo;
     } else if (!(tipo == 'M' ? formar_bajas(cadena, &propuesta, bajas)
@@ -866,6 +889,7 @@ static bool misma_cabecera(const EvidenciaCierre *a, const EvidenciaCierre *b) {
 }
 
 static bool guardar_decision(Cadena *cadena) {
+    // Repetir la decisión permite confirmar de nuevo sin anexar otra marca.
     if (!cadena->definitiva && !anexar(cadena, "CERRADA_META\n")) {
         return false;
     }
@@ -916,6 +940,11 @@ static bool evidencia_completa(const EvidenciaCierre *cierre) {
     return suma == cierre->total;
 }
 
+/*
+ * Comprueba el certificado recibido antes de registrar el cierre.
+ * Devuelve true si guarda la decisión. Las ventas propias ausentes del
+ * certificado se marcan aparte y conservan su registro original.
+ */
 static bool guardar_importacion(Cadena *cadena) {
     EvidenciaCierre *borrador = &cadena->borrador;
     if (!evidencia_completa(borrador)) {
@@ -1046,7 +1075,11 @@ static bool atender_evidencia(Cadena *cadena, char *campos[CAMPOS], size_t n, ch
     return false;
 }
 
-/* La preparación fija el conjunto de ventas comprobado en este historial. */
+/*
+ * Atiende los pasos del cierre desde el propietario. Devuelve true si el
+ * mensaje queda resuelto, incluso si se rechaza. Solo confirma la preparación
+ * cuando se cotejaron todas las ventas y se escribió el registro.
+ */
 static bool atender_cierre(Cadena *cadena, char *campos[CAMPOS], size_t n, char *respuesta) {
     const char *cmd = campos[0];
     if (atender_evidencia(cadena, campos, n, respuesta)) {
@@ -1097,6 +1130,7 @@ static bool atender_cierre(Cadena *cadena, char *campos[CAMPOS], size_t n, char 
         if (leer_item(cadena, campos + 2, &dato)) {
             Venta *venta = venta_por_id(cadena, dato.origen, dato.secuencia);
             if (venta && venta->importe == dato.importe) {
+                // Consultar de nuevo la misma venta no aumenta el recuento.
                 if (!venta->cotejada) {
                     venta->cotejada = true;
                     ++cadena->cotejadas;
@@ -1159,7 +1193,7 @@ static char estado_monitoreado(const Cadena *cadena) {
     return cadena->lista && !cadena->reiniciada && !cadena->cambio.version ? 'A' : 'R';
 }
 
-/* Cuenta ventas propias que aún requieren un ACK en la vista instalada. */
+// Cuenta las ventas propias con alguna confirmación de aplicación pendiente.
 static size_t pendientes_propias(const Cadena *cadena) {
     size_t pendientes = 0;
     for (size_t i = 0; i < cadena->usadas; ++i) {
@@ -1172,7 +1206,7 @@ static size_t pendientes_propias(const Cadena *cadena) {
     return pendientes;
 }
 
-/* Responde desde el propietario. El resumen fija el límite de la enumeración. */
+// El último identificador propio del resumen fija hasta dónde se listan las ventas.
 static bool atender_monitor(Cadena *cadena, char *campos[CAMPOS], size_t cantidad, char *respuesta) {
     if (!cantidad || (strcmp(campos[0], "ESTADO") != 0 && strcmp(campos[0], "VENTA_PROPIA") != 0)) {
         return false;
@@ -1379,6 +1413,10 @@ static void terminar_envio(Cadena *cadena, const Mensaje *resultado) {
     }
     Venta *venta = &cadena->ventas[cadena->en_envio];
     cadena->en_envio = SIZE_MAX;
+    /*
+     * Las confirmaciones de difusión quedan en pausa durante un cambio de lista
+     * o la conciliación. Una respuesta de otra versión también se descarta.
+     */
     if (resultado->cambio.version != cadena->version || cadena->cambio.version || cadena->conciliando) {
         return;
     }
@@ -1412,6 +1450,11 @@ static void terminar_envio(Cadena *cadena, const Mensaje *resultado) {
     }
 }
 
+/*
+ * Devuelve la primera posición que falta confirmar y deja en previa quién
+ * aplicó justo antes. Si el origen quedó fuera, previa empieza en cantidad.
+ * Devuelve cantidad si ninguna tienda de la lista necesita confirmación.
+ */
 static size_t turno_pendiente(const Cadena *cadena, const Venta *venta, size_t *previa) {
     *previa = posicion(cadena, venta->origen);
     for (size_t i = 0; i < cadena->cantidad; ++i) {
@@ -1484,6 +1527,7 @@ static int programar(Cadena *cadena, Canal *emisor) {
     for (size_t i = 0; i < cadena->usadas; ++i) {
         size_t indice = (cadena->proxima + i) % cadena->usadas;
         Venta *venta = &cadena->ventas[indice];
+        // Mientras el origen siga activo, queda a cargo de difundir su venta.
         if (venta->origen != cadena->propia && posicion(cadena, venta->origen) < cadena->cantidad) {
             continue;
         }
@@ -1575,6 +1619,7 @@ static bool atender_canales(Cadena *cadena, Canal canales[TRABAJADORES], size_t 
         }
         struct pollfd fds[2 * TRABAJADORES + 1];
         fds[0] = (struct pollfd){.fd = fin, .events = POLLIN};
+        // Vigila la escritura solo cuando hay algo que entregar a ese trabajador.
         for (size_t i = 0; i < activos; ++i) {
             fds[1 + 2 * i] = (struct pollfd){.fd = canales[i].desde_hilo[0], .events = POLLIN};
             fds[2 + 2 * i] = (struct pollfd){.fd = canales[i].enviar ? canales[i].hacia_hilo[1] : -1,
@@ -1618,7 +1663,7 @@ static bool atender_canales(Cadena *cadena, Canal canales[TRABAJADORES], size_t 
     }
 }
 
-// Arranque y terminación
+// Reconstrucción del historial
 
 static bool leer_venta(Cadena *cadena, char *campos[CAMPOS], size_t cantidad) {
     if (cantidad < 5 || cantidad > 6 || !cadena->version ||
@@ -1633,6 +1678,7 @@ static bool leer_venta(Cadena *cadena, char *campos[CAMPOS], size_t cantidad) {
         return false;
     }
     if (venta.origen == cadena->propia) {
+        // Las ventas propias conservan la secuencia y una clave única por compra.
         if (cantidad != 6 || !clave_valida(campos[5]) || cadena->secuencia == INT64_MAX ||
             venta.secuencia != cadena->secuencia + 1) {
             return false;
@@ -1797,7 +1843,11 @@ static bool leer_registro(Cadena *cadena, char *linea, uint32_t *preparada) {
     return false;
 }
 
-// Valida el archivo completo antes de admitir conexiones comerciales.
+/*
+ * Lee el historial completo y reconstruye los datos del propietario.
+ * Devuelve true si la evidencia permite el modo solicitado. Un cierre o
+ * una ronda inconclusa puede permitir consulta sin permitir reanudar ventas.
+ */
 static bool reconstruir(Cadena *cadena, const char *cabecera) {
     int fd = dup(cadena->historial);
     FILE *archivo = fd == -1 ? NULL : fdopen(fd, "r");
@@ -1826,6 +1876,7 @@ static bool reconstruir(Cadena *cadena, const char *cabecera) {
         }
         valido = leer_registro(cadena, linea, &preparada);
     }
+    // La marca final debe cerrar el archivo y, si se importó, el certificado completo.
     if (cerrada && (fgetc(archivo) != EOF ||
                     (cadena->cierre.items && !evidencia_completa(&cadena->cierre)))) {
         valido = false;
@@ -1926,6 +1977,8 @@ static Cadena iniciar_propietario(const Configuracion *config, const ConfigTiend
     }
     return cadena;
 }
+
+// Arranque y terminación del proceso de tienda
 
 static int ejecutar(const Configuracion *config, const ConfigTienda *tienda,
                     const ConfigTienda *entrada, bool solo_lectura) {
@@ -2035,8 +2088,10 @@ static int ejecutar(const Configuracion *config, const ConfigTienda *tienda,
     }
 
 cerrar:
-    // El cierre de las salidas despierta a los hilos. Se esperan antes
-    // de cerrar el socket y los extremos restantes.
+    /*
+     * Cerrar los pipes hacia los trabajadores les indica que deben salir.
+     * Después de esperar a los hilos se cierran el socket y los extremos restantes.
+     */
     for (size_t i = 0; i < activos; ++i) {
         close(canales[i].hacia_hilo[1]);
     }
@@ -2109,7 +2164,11 @@ int tienda_consultar_historial(const Configuracion *config, const ConfigTienda *
     return resultado;
 }
 
-/* Usa los mismos validadores que el monitor antes de volver a iniciar un hijo. */
+/*
+ * Clasifica el historial para el lanzador sin modificarlo. Si se solicitan,
+ * informa si la clave e importe coinciden y qué tiendas quedaron fuera del cierre.
+ * Devuelve ARCHIVO_BLOQUEADO cuando la evidencia no permite un arranque seguro.
+ */
 EstadoArchivoTienda tienda_inspeccionar_historial(const Configuracion *config, const ConfigTienda *tienda,
                                                   const char *clave, int64_t importe, bool *registrada,
                                                   uint64_t *excluidas) {

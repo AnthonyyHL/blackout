@@ -73,6 +73,7 @@ static const char *describir_estado(const char *estado) {
 }
 
 static void observacion(const Consulta *consulta, const char *cadena, const char *tipo) {
+    // La hora corresponde a la observación, no a la venta ni al cierre.
     char hora[32] = "no_disponible";
     time_t ahora = time(NULL);
     struct tm utc;
@@ -92,7 +93,11 @@ static void observacion(const Consulta *consulta, const char *cadena, const char
     printf(" observado=%s\n", hora);
 }
 
-/* Enumera solo el prefijo de ventas propias que existía al responder el estado. */
+/*
+ * Enumera las ventas propias hasta el último identificador anunciado en el resumen.
+ * Devuelve false si falta una venta, la respuesta es inválida o la suma no coincide.
+ * Las filas ya mostradas se conservan si la enumeración se interrumpe.
+ */
 static bool mostrar_ventas(Consulta *consulta, const char *cadena, int64_t ultima, int64_t propio) {
     int64_t suma = 0;
     for (int64_t i = 0; i < ultima; ++i) {
@@ -111,7 +116,11 @@ static bool mostrar_ventas(Consulta *consulta, const char *cadena, int64_t ultim
     return suma == propio;
 }
 
-/* Coteja la respuesta del protocolo de cierre antes de mostrar su alcance. */
+/*
+ * Consulta el alcance del certificado y comprueba sus participantes.
+ * Devuelve false si no logra completar el detalle que ofrece la tienda.
+ * Una marca guardada sin certificado se puede mostrar por separado.
+ */
 static bool mostrar_cierre(Consulta *consulta, const Configuracion *config, const char *cadena) {
     char linea[RED_MAX_LINEA + 1], respuesta[RED_MAX_LINEA + 1], *campos[6];
     snprintf(linea, sizeof linea, "PRUEBA_CIERRE %s 0\n", cadena);
@@ -119,6 +128,7 @@ static bool mostrar_cierre(Consulta *consulta, const Configuracion *config, cons
         return false;
     }
     if (strcmp(respuesta, "ERROR\n") == 0) {
+        // El resumen ya declaró el cierre. Falta el detalle del certificado.
         puts("CIERRE_GUARDADO sin_detalle_de_certificacion");
         return true;
     }
@@ -142,6 +152,7 @@ static bool mostrar_cierre(Consulta *consulta, const Configuracion *config, cons
         if (!par || par->cadena != consulta->tienda->cadena) {
             return false;
         }
+        // Cada identidad configurada puede figurar una sola vez en el certificado.
         uint64_t bit = UINT64_C(1) << (par - config->tiendas);
         if (vistos & bit) {
             return false;

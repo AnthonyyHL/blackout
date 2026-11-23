@@ -5,15 +5,19 @@
 
 enum { RECUPERACION_MS = 5000 };
 
+/*
+ * Una vista es la lista ordenada de tiendas que participan en la cadena.
+ * La versión distingue esa lista de las anteriores.
+ */
 typedef struct {
-    uint32_t version, base;
-    char tipo;
+    uint32_t version, base; // Versión propuesta y versión de partida.
+    char tipo; // Distingue baja individual, baja múltiple, retorno y reinicio.
     size_t objetivo, cantidad;
-    unsigned char orden[CONFIG_MAX_TIENDAS];
-    uint64_t bajas; // Un bit por posición de la vista base en las bajas del ensayo.
+    unsigned char orden[CONFIG_MAX_TIENDAS]; // Índices de tiendas en la configuración.
+    uint64_t bajas; // Un bit por posición retirada de la lista de partida.
 } CambioLista;
 
-// El emisor coordina una sola ronda. Los propietarios validan y registran cada paso.
+// El emisor pide el cambio. Cada propietario comprueba y guarda su parte del acuerdo.
 bool recuperacion_acordar(const Configuracion *config, const ConfigTienda *propia,
                           const CambioLista *cambio, int fin);
 

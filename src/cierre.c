@@ -18,8 +18,8 @@ static bool pedir(const ConfigTienda *par, int fin, int64_t vence, char *respues
 }
 
 /*
- * Envía un dato del inventario ya conciliado a todos los propietarios.
- * Cada uno verifica su propio registro y cuenta cada ID una sola vez.
+ * Pide a las tiendas comprobar una por una las ventas que resultaron de la recuperación.
+ * Devuelve true si cada una comprueba todos los identificadores e importes.
  */
 static bool verificar(const Configuracion *config, const ConfigTienda *propia,
                       const char *cadena, const CambioLista *lista, int fin, int64_t vence) {
@@ -46,6 +46,11 @@ static bool verificar(const Configuracion *config, const ConfigTienda *propia,
     }
 }
 
+/*
+ * Pide detener la difusión ordinaria para intercambiar las ventas faltantes
+ * y comprobar que todas las tiendas conocen las mismas ventas e importes.
+ * Devuelve true si todas guardan su preparación y la primera guarda la decisión.
+ */
 static bool preparar(const Configuracion *config, const ConfigTienda *propia,
                      const char *cadena, const CambioLista *lista, int fin, int64_t vence) {
     char respuesta[RED_MAX_LINEA + 1];
@@ -66,7 +71,7 @@ static bool preparar(const Configuracion *config, const ConfigTienda *propia,
         return false;
     }
     resumen[strlen(resumen) - 1] = '\0';
-    // El coordinador registra su preparación antes de pedir la de los demás.
+    // La lista empieza por la tienda que coordina. Su preparación se guarda primero.
     for (size_t i = 0; i < lista->cantidad; ++i) {
         const ConfigTienda *par = &config->tiendas[lista->orden[i]];
         if (!pedir(par, fin, vence, respuesta, "PREPARAR_CIERRE %s %" PRIu32 " %s\n",
@@ -78,6 +83,11 @@ static bool preparar(const Configuracion *config, const ConfigTienda *propia,
                  cadena, lista->version) && strcmp(respuesta, "GUARDADA\n") == 0;
 }
 
+/*
+ * Ejecuta un paso de cierre sobre la lista activa copiada al emisor.
+ * En la distribución devuelve true si todas confirman que guardaron la decisión.
+ * Los avisos de salida se intentan después y sus fallos se informan por separado.
+ */
 bool cierre_ejecutar(const Configuracion *config, const ConfigTienda *propia,
                      const CambioLista *lista, enum TrabajoCierre trabajo, int fin) {
     int64_t ahora = red_reloj_ms();
@@ -96,6 +106,7 @@ bool cierre_ejecutar(const Configuracion *config, const ConfigTienda *propia,
         return false;
     }
     vence = red_reloj_ms() + RECUPERACION_MS;
+    // Las demás guardan la decisión antes de que se envíen los avisos de salida.
     for (size_t i = 1; i < lista->cantidad; ++i) {
         const ConfigTienda *par = &config->tiendas[lista->orden[i]];
         if (!pedir(par, fin, vence, respuesta, "DECIDIR_CIERRE %s %" PRIu32 "\n",
@@ -113,6 +124,12 @@ bool cierre_ejecutar(const Configuracion *config, const ConfigTienda *propia,
     return true;
 }
 
+// Recuperación de un cierre acreditado por un par
+
+/*
+ * Lee los miembros y ventas que ofrece el par y los envía al propietario local.
+ * Devuelve true cuando el propietario confirma que guardó la evidencia.
+ */
 static bool copiar_evidencia(const ConfigTienda *propia, const ConfigTienda *par,
                              const char *cadena, const char *cabecera, int fin, int64_t vence) {
     char respuesta[RED_MAX_LINEA + 1], datos[RED_MAX_LINEA + 1];

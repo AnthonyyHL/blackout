@@ -33,10 +33,15 @@ typedef enum { INACTIVA, ARRANCANDO, ABIERTA, PAUSADA, CERRANDO, CERRADA, ERROR_
 typedef struct {
     pid_t pid;
     int salida;
+    // El proceso anuncia su estado. El historial se lee aparte para comprobar el cierre.
     Estado estado;
     EstadoArchivoTienda archivo;
     bool incorporada, cortada, matando, excluida, saturada, bloqueo_reportado;
     size_t primera, cursor_baja;
+    /*
+     * La vista es la lista ordenada de participantes que anuncia la tienda.
+     * Cada bit corresponde a una tienda del JSON. orden conserva los lugares anunciados.
+     */
     uint64_t vista;
     unsigned char orden[CONFIG_MAX_TIENDAS];
     size_t cantidad_vista;
@@ -47,9 +52,9 @@ typedef struct {
 } Hijo;
 
 typedef struct {
-    // La secuencia global también identifica la compra persistida en el diario.
+    // La secuencia identifica la compra en el diario. Cero deja libre la plaza.
     int64_t secuencia, importe, reintentar;
-    bool intentada; // El diario registra la encomienda del primer intento.
+    bool intentada; // El primer intento ya quedó anotado en el diario.
     bool en_vuelo;  // Conserva una plaza mientras falta el resultado de admisión.
     bool en_envio;  // Un trabajador está atendiendo el intento TCP actual.
 } Compra;
@@ -139,7 +144,7 @@ static int compras_en_espera(const Simulacion *sim, size_t i) {
     return cantidad;
 }
 
-// Diario del lanzador. Cada intención se completa antes de enviarla a una tienda.
+// Diario del lanzador. Guarda la clave y el importe antes del primer envío.
 
 static bool guardar(Simulacion *sim, const char *formato, ...) {
     va_list args;
@@ -155,6 +160,7 @@ static bool guardar(Simulacion *sim, const char *formato, ...) {
 }
 
 static bool terminar_compra(Simulacion *sim, Compra *compra) {
+    // La plaza queda libre cuando el diario registra que ya no hay que reintentar.
     if (!guardar(sim, "F %" PRId64 "\n", compra->secuencia)) {
         return false;
     }
@@ -162,6 +168,10 @@ static bool terminar_compra(Simulacion *sim, Compra *compra) {
     return true;
 }
 
+/*
+ * Recupera del diario una compra generada, su primer intento, su fin o un corte.
+ * Devuelve false si la línea contradice los registros anteriores o está incompleta.
+ */
 static bool registro(Simulacion *sim, char *linea) {
     size_t n = strlen(linea);
     if (!n || linea[n - 1] != '\n') {
@@ -226,7 +236,7 @@ static bool registro(Simulacion *sim, char *linea) {
     return false;
 }
 
-/* Al reanudar solo los intentos inciertos pueden ocupar las plazas en vuelo. */
+// Al reanudar solo los intentos inciertos pueden ocupar las plazas en vuelo.
 static bool cargar_capacidades(Simulacion *sim) {
     for (size_t i = 0; i < sim->config.cantidad_tiendas; ++i) {
         const ConfigCompras *config = &tienda(sim, i)->compras;
@@ -274,6 +284,11 @@ static bool cabecera(Simulacion *sim, bool reanudar) {
     return true;
 }
 
+/*
+ * Abre el diario exclusivo del lanzador y comprueba el escenario.
+ * Devuelve true si puede empezar a anexar o si reconstruyó los pendientes
+ * dentro de las capacidades configuradas. El llamador cierra el diario abierto.
+ */
 static bool abrir_diario(Simulacion *sim, bool reanudar) {
     size_t longitud = strlen(sim->ruta) + sizeof ".simulacion";
     char *ruta = malloc(longitud);
@@ -288,6 +303,7 @@ static bool abrir_diario(Simulacion *sim, bool reanudar) {
         return false;
     }
     struct stat datos;
+    // El bloqueo de escritura impide que dos lanzadores usen a la vez el diario.
     struct flock bloqueo = {.l_type = F_WRLCK, .l_whence = SEEK_SET};
     if (fstat(fd, &datos) == -1 || !S_ISREG(datos.st_mode) || fcntl(fd, F_SETLK, &bloqueo) == -1 ||
         ((datos.st_size != 0) != reanudar) || (sim->diario = fdopen(fd, "a+")) == NULL) {
@@ -337,6 +353,7 @@ invalido:
 // Procesos de tienda y trabajadores de compras.
 
 static void cerrar_canales_heredados(const Simulacion *sim) {
+    // El hijo solo conserva sus canales para no mantener abiertos los demás pipes.
     close(fileno(sim->diario));
     for (size_t i = 0; i < TRABAJADORES; ++i) {
         if (sim->trabajadores[i].pid) {
@@ -414,6 +431,7 @@ static void intercambiar_en_trabajador(const Simulacion *sim, int entrada, int s
     while (transferir(entrada, &peticion, sizeof peticion, false)) {
         char respuesta[RED_MAX_LINEA + 1] = "", error[128];
         int64_t ahora = red_reloj_ms();
+        // Una respuesta vacía deja el resultado de admisión sin confirmar.
         if (ahora < 0 || !red_intercambiar_hasta(tienda(sim, peticion.destino), peticion.linea, respuesta,
                                                 error, sizeof error, ahora + RED_PLAZO_MS)) {
             respuesta[0] = '\0';
@@ -544,6 +562,11 @@ static void acreditar(Simulacion *sim, size_t i) {
     }
 }
 
+/*
+ * Recoge los hijos locales que terminaron y revisa su historial.
+ * El estado de salida ayuda a distinguir corte, error y detención del ensayo.
+ * Solo la evidencia guardada acredita un cierre comercial.
+ */
 static void recoger_tiendas(Simulacion *sim, int64_t ahora, bool saliendo) {
     for (size_t i = 0; i < sim->config.cantidad_tiendas; ++i) {
         Hijo *hijo = &sim->hijos[i];
@@ -609,7 +632,7 @@ static void esperar_eventos(const Simulacion *sim, int ms) {
     (void)poll(fds, n, ms);
 }
 
-// Alta escalonada para historiales nuevos. Los existentes acuerdan la vista por TCP.
+// Las cadenas nuevas incorporan sus tiendas en orden. Las demás recuperan la lista por TCP.
 static bool arrancar(Simulacion *sim) {
     const char *primera[CONFIG_MAX_CADENAS] = {0};
     for (size_t i = 0; i < sim->config.cantidad_tiendas; ++i) {
@@ -647,7 +670,7 @@ static bool arrancar(Simulacion *sim) {
     return true;
 }
 
-// Compras. Los vencimientos de cada tienda avanzan aunque queden ACK por recibir.
+// El intervalo de compras avanza aunque falten respuestas de admisión.
 
 static uint64_t sortear_importe(void) {
     uint64_t valor = 0;
@@ -664,6 +687,7 @@ static void generar(Simulacion *sim, int64_t ahora) {
         if (hijo->estado != ABIERTA || hijo->matando || ahora < hijo->proxima) {
             continue;
         }
+        // El intervalo avanza aun si no queda sitio para generar otra compra.
         hijo->proxima = ahora + config->intervalo_ms;
         Compra *sitio = libre(sim, i);
         if (!sitio || compras_en_espera(sim, i) >= config->max_compras_en_espera) {
@@ -682,6 +706,7 @@ static void generar(Simulacion *sim, int64_t ahora) {
         int64_t amplitud = config->importe_max_centavos - config->importe_min_centavos + 1;
         int64_t importe = config->importe_min_centavos + (int64_t)(sortear_importe() % (uint64_t)amplitud);
         int64_t secuencia = sim->secuencia + 1;
+        // Se registra la intención antes de que la compra entre a la cola.
         if (!guardar(sim, "P %s %" PRId64 " %" PRId64 "\n", tienda(sim, i)->id, secuencia, importe)) {
             return;
         }
@@ -701,6 +726,10 @@ static bool entregar(Simulacion *sim, Trabajador *trabajador, Peticion *peticion
     return true;
 }
 
+/*
+ * Devuelve el índice de la compra más antigua que se puede enviar ahora
+ * o SIN_TRABAJO. Un reintento que sigue en vuelo conserva su plaza.
+ */
 static int proxima_compra(const Simulacion *sim, size_t i, int64_t ahora) {
     const Hijo *hijo = &sim->hijos[i];
     if (hijo->estado != ABIERTA || hijo->matando) {
@@ -725,6 +754,7 @@ static int proxima_compra(const Simulacion *sim, size_t i, int64_t ahora) {
 
 static void enviar_compras(Simulacion *sim, int64_t ahora) {
     size_t tiendas = sim->config.cantidad_tiendas;
+    // El primer trabajador queda disponible para avisar bajas aunque haya compras pendientes.
     for (size_t w = 1; w < TRABAJADORES && !detener && !sim->error; ++w) {
         Trabajador *trabajador = &sim->trabajadores[w];
         if (trabajador->trabajo != SIN_TRABAJO) {
@@ -741,6 +771,7 @@ static void enviar_compras(Simulacion *sim, int64_t ahora) {
             char clave[CONFIG_MAX_ID + 1];
             clave_compra(clave, compra->secuencia);
             snprintf(peticion.linea, sizeof peticion.linea, "COMPRA %s %" PRId64 "\n", clave, compra->importe);
+            // Si se interrumpe el primer envío, el diario conserva la clave y el intento.
             if (!compra->intentada && !guardar(sim, "E %" PRId64 "\n", compra->secuencia)) {
                 return;
             }
@@ -789,6 +820,7 @@ static void recibir_resultados(Simulacion *sim, int64_t ahora) {
         if (trabajo == TRABAJO_BAJA) {
             continue;
         }
+        // La división recupera la tienda y el resto recupera la plaza de la compra.
         size_t i = (size_t)trabajo / CAPACIDAD;
         Compra *compra = &sim->compras[i][trabajo % CAPACIDAD];
         compra->en_envio = false;
@@ -817,6 +849,11 @@ static void recibir_resultados(Simulacion *sim, int64_t ahora) {
     }
 }
 
+/*
+ * Devuelve true si todos los cierres están acreditados y no quedan envíos en curso.
+ * Una cadena puede acreditar el cierre para una tienda excluida. Las compras
+ * cuyo resultado no se puede comprobar quedan pendientes en el diario.
+ */
 static bool todos_cerrados(Simulacion *sim) {
     bool todos = true;
     for (size_t i = 0; i < sim->config.cantidad_tiendas; ++i) {
@@ -840,7 +877,7 @@ static bool todos_cerrados(Simulacion *sim) {
                 todos = false;
                 continue;
             }
-            if (compra->reintentar == INT64_MAX) {
+        if (compra->reintentar == INT64_MAX) {
                 continue;
             }
             char clave[CONFIG_MAX_ID + 1];
@@ -853,6 +890,7 @@ static bool todos_cerrados(Simulacion *sim) {
                        registrada ? "registrada" : "sin_registro");
                 terminar_compra(sim, compra);
             } else {
+                // Queda en el diario y se evita volver a consultar el mismo historial.
                 compra->reintentar = INT64_MAX;
             }
         }
@@ -860,7 +898,7 @@ static bool todos_cerrados(Simulacion *sim) {
     return todos;
 }
 
-// Cortes del ensayo. B acredita waitpid. El acuerdo real se hace entre las tiendas.
+// Cortes de procesos hijos y avisos de baja a las supervivientes
 
 static double sorteo(void) {
     return rand() / ((double)RAND_MAX + 1.0);
@@ -887,6 +925,11 @@ static void sortear_cortes(Simulacion *sim) {
     }
 }
 
+/*
+ * Comprueba si la tienda ya está fuera de la lista de las supervivientes.
+ * Si aún figura, intenta avisar juntas las bajas comprobadas para esa versión.
+ * El envío del aviso por sí solo no confirma que se instaló la lista.
+ */
 static bool baja_instalada(Simulacion *sim, size_t i, int64_t ahora) {
     int grupo = tienda(sim, i)->cadena;
     Hijo *baja = &sim->hijos[i];
@@ -940,6 +983,7 @@ static bool baja_instalada(Simulacion *sim, size_t i, int64_t ahora) {
             // Si cayó la primera, solo la primera superviviente acepta la propuesta.
             Peticion peticion = {.destino = j};
             uint64_t posiciones = 0;
+            // Convierte los bits por tienda en bits por posición de la lista.
             for (size_t pos = 0; pos < par->cantidad_vista; ++pos) {
                 if (bajas & (UINT64_C(1) << par->orden[pos])) {
                     posiciones |= UINT64_C(1) << pos;
@@ -963,7 +1007,7 @@ static void reiniciar_tienda(Simulacion *sim, size_t i) {
     }
 }
 
-/* Sin supervivientes, los miembros de la vista guardada deben poder encontrarse al volver. */
+// Sin supervivientes, se espera a que puedan volver juntas las tiendas pendientes.
 static void reiniciar_cadena_caida(Simulacion *sim, int grupo, int64_t ahora) {
     for (size_t i = 0; i < sim->config.cantidad_tiendas; ++i) {
         const Hijo *hijo = &sim->hijos[i];
@@ -1082,7 +1126,7 @@ static bool hay_trabajo(const Simulacion *sim) {
 }
 
 static int espera_siguiente(const Simulacion *sim, int64_t ahora) {
-    int64_t espera = 20;  // waitpid se comprueba también si no hay actividad en pipes.
+    int64_t espera = 20; // Vuelve a consultar waitpid aunque ningún pipe tenga datos.
     for (size_t i = 0; i < sim->config.cantidad_tiendas; ++i) {
         if (sim->hijos[i].estado == ABIERTA && sim->hijos[i].proxima > ahora &&
             sim->hijos[i].proxima - ahora < espera) {
@@ -1092,6 +1136,13 @@ static int espera_siguiente(const Simulacion *sim, int64_t ahora) {
     return (int)espera;
 }
 
+// Atención de eventos y detención del ensayo
+
+/*
+ * Alterna el seguimiento de hijos, los cortes y la generación de compras.
+ * Devuelve true al acreditar los cierres. La detención, el error y la
+ * falta de progreso interrumpen la atención con los pendientes disponibles.
+ */
 static bool ejecutar(Simulacion *sim) {
     int64_t ahora = red_reloj_ms();
     if (ahora < 0) {
@@ -1179,7 +1230,11 @@ static bool quedan_hijos(const Simulacion *sim) {
     return false;
 }
 
-/* Primero deja estabilizar cambios ya iniciados. Luego solicita y acota la salida. */
+/*
+ * En una detención normal da un plazo a los cambios ya iniciados.
+ * Después cierra los pipes y pide terminar los hijos. Si alguno sigue
+ * registrado al vencer el plazo, fuerza la salida e intenta recogerlo.
+ */
 static void limpiar(Simulacion *sim, bool estable) {
     int64_t ahora = red_reloj_ms();
     int64_t vence = ahora + DETENCION_MS;
@@ -1305,6 +1360,7 @@ int simulacion_ejecutar(const char *ruta, bool reanudar) {
     }
     if (detener) {
         puts("SIMULACION_DETENIDA");
+        // 130 sigue la convención 128 + SIGINT (2) y también se usa para SIGTERM.
         return 130;
     }
     return exito ? EXIT_SUCCESS : EXIT_FAILURE;

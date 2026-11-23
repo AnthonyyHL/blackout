@@ -13,7 +13,7 @@
 typedef struct {
     const char *inicio;
     const char *actual;
-    const char *campo;
+    const char *campo; // Nombre que acompaña al diagnóstico de lectura.
     char *error;
     size_t capacidad_error;
 } LectorJson;
@@ -71,6 +71,7 @@ static bool digito(char byte) {
     return byte >= '0' && byte <= '9';
 }
 
+// Primero comprueba la sintaxis JSON. La conversión posterior verifica el rango.
 static bool leer_numero(LectorJson *json, bool real, const char **inicio) {
     saltar_espacios(json);
     *inicio = json->actual;
@@ -167,6 +168,7 @@ static bool leer_id(LectorJson *json, char id[CONFIG_MAX_ID + 1]) {
 
 static const char clave_limite[] = "limite_gubernamental_centavos";
 
+// Una marca por clave permite detectar duplicados sin imponer un orden de lectura.
 static int leer_campo(LectorJson *json, const char *const *campos, size_t cantidad,
                       unsigned *vistos) {
     char clave[40];
@@ -211,12 +213,14 @@ static bool cerrar_objeto(LectorJson *json, const char *const *campos, size_t ca
 
 #define CANTIDAD(campos) (sizeof (campos) / sizeof (campos)[0])
 
+// Objetos del escenario
+
 static bool leer_compras(LectorJson *json, ConfigCompras *compras) {
     const char *const campos[] = {"importe_min_centavos", "importe_max_centavos", "intervalo_ms",
                                   "max_solicitudes_en_vuelo", "max_compras_en_espera"};
     const int64_t maximos[] = {INT64_MAX, INT64_MAX, INT_MAX,
                                CONFIG_MAX_SOLICITUDES_EN_VUELO, CONFIG_MAX_COMPRAS_EN_ESPERA};
-    int64_t valores[] = {0, 0, 0, 2, 2};
+    int64_t valores[] = {0, 0, 0, 2, 2}; // Las dos capacidades son opcionales.
     unsigned vistos = 0;
     if (!tomar(json, '{')) {
         return fallar(json, "se esperaba un objeto de compras");
@@ -290,7 +294,7 @@ static bool leer_tienda(LectorJson *json, ConfigTienda *tienda, int cadena) {
         }
     } while (tomar(json, ','));
     if (suelta && !tienda->direccion[0] && !tienda->puerto) {
-        // El par completo es opcional para una independiente sin escucha TCP.
+        // Una independiente puede omitir ambos campos. Si declara uno, necesita el otro.
         vistos |= (1u << 2) | (1u << 3);
     }
     // Fuera de la simulación se puede consultar o atender una tienda sin programar compras.
@@ -479,6 +483,13 @@ static bool leer_raiz(LectorJson *json, Configuracion *config) {
     return config->cantidad_tiendas != 0 || fallar(json, "se requiere al menos una tienda");
 }
 
+// Rutas y datos repetidos
+
+/*
+ * Resuelve una ruta de historial a partir del directorio del JSON.
+ * Devuelve true si obtiene una ruta válida dentro del límite de longitud.
+ * Normaliza los componentes sin abrir archivos ni resolver enlaces simbólicos.
+ */
 static bool resolver_historial(char historial[CONFIG_MAX_RUTA + 1], const char *directorio) {
     char ruta[CONFIG_MAX_RUTA * 2 + 2];
     int longitud = historial[0] == '/'
@@ -492,7 +503,6 @@ static bool resolver_historial(char historial[CONFIG_MAX_RUTA + 1], const char *
         return false;
     }
 
-    // Compara rutas léxicas sin abrir ni crear los historiales.
     size_t usados = 0;
     char *siguiente;
     for (char *parte = strtok_r(ruta, "/", &siguiente); parte;
@@ -581,6 +591,11 @@ static bool directorio_del_json(const char *ruta, char directorio[CONFIG_MAX_RUT
     return true;
 }
 
+/*
+ * Lee el archivo completo, comprueba sus objetos y verifica los datos repetidos.
+ * Devuelve true y entrega la configuración solo después de validar todo.
+ * Si falla, deja intacta la configuración recibida y escribe un diagnóstico.
+ */
 bool configuracion_cargar(const char *ruta, Configuracion *config,
                           char *error, size_t capacidad_error) {
     FILE *archivo = fopen(ruta, "rb");
@@ -589,6 +604,7 @@ bool configuracion_cargar(const char *ruta, Configuracion *config,
         return false;
     }
     char datos[CONFIG_MAX_ARCHIVO + 1];
+    // El byte adicional permite distinguir un archivo demasiado grande.
     size_t leidos = fread(datos, 1, sizeof datos, archivo);
     bool fallo = ferror(archivo) != 0;
     if (fclose(archivo) != 0 || fallo) {

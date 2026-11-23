@@ -3,6 +3,7 @@
 
 #include "configuracion.h"
 
+// El máximo incluye el salto de línea. Los plazos se miden en milisegundos.
 enum { RED_MAX_LINEA = 128, RED_PLAZO_MS = 3000, RED_RECEPTORES = 2 };
 
 typedef struct {
@@ -19,11 +20,13 @@ int red_escuchar(const ConfigTienda *tienda);
 bool red_no_bloqueante(int fd);
 int64_t red_reloj_ms(void);
 bool red_fin_solicitado(int fd);
+// El socket de escucha debe ser no bloqueante y el canal local debe estar listo.
 void red_recibir(const ServidorRed *servidor);
 /*
- * Envía una línea terminada en LF y espera otra con plazos acotados.
- * Devuelve true si recibe una línea completa en respuesta, que admite
- * RED_MAX_LINEA + 1 bytes. Si falla, devuelve false y escribe el error.
+ * Envía una línea con salto de línea al final y espera otra con plazos acotados.
+ * Devuelve true al recibir una línea completa en el búfer de respuesta
+ * de RED_MAX_LINEA + 1 bytes. El llamador interpreta el contenido.
+ * Si falla, devuelve false y escribe el error.
  */
 bool red_intercambiar(const ConfigTienda *destino, const char *linea, char *respuesta,
                       char *error, size_t capacidad_error);

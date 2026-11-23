@@ -14,7 +14,7 @@ typedef struct {
     char datos[512];
     size_t siguiente;
     size_t fin;
-    int64_t recibido_en;
+    int64_t recibido_en; // Momento de la última lectura del socket.
 } LectorRed;
 
 typedef enum {
@@ -43,6 +43,11 @@ static int64_t plazo_hasta(int64_t limite) {
     return limite >= 0 && limite < plazo ? limite : plazo;
 }
 
+/*
+ * Espera un descriptor hasta el plazo absoluto dado por el reloj monotónico.
+ * Devuelve true si se puede intentar la operación. El socket informa su resultado.
+ * Los reintentos tras una señal conservan el mismo plazo.
+ */
 static bool esperar(int fd, short evento, int64_t vence) {
     if (vence < 0) {
         return false;
@@ -64,7 +69,6 @@ static bool esperar(int fd, short evento, int64_t vence) {
                 return false;
             }
             if (ahora < vence) {
-                // La operación del socket informa EOF o el error concreto.
                 return true;
             }
             errno = ETIMEDOUT;
@@ -97,6 +101,11 @@ static bool escribir_linea(int fd, const char *linea, size_t longitud, int64_t v
     return longitud == 0;
 }
 
+/*
+ * Lee hasta el salto de línea y conserva los datos de las líneas siguientes.
+ * Devuelve el resultado de la lectura y deja la línea en el búfer si la completa.
+ * Conserva el plazo de esta línea aunque llegue en varios fragmentos.
+ */
 static ResultadoLinea leer_linea(int fd, LectorRed *lector, char linea[RED_MAX_LINEA + 1],
                                 int64_t vence) {
     size_t usados = 0;
@@ -130,7 +139,7 @@ static ResultadoLinea leer_linea(int fd, LectorRed *lector, char linea[RED_MAX_L
         linea[usados++] = byte;
         if (byte == '\n') {
             linea[usados] = '\0';
-            // Reemplazar la línea por una trama inválida si contenía un NUL.
+            // Un byte nulo invalida toda la línea, aunque el inicio parezca correcto.
             if (memchr(linea, '\0', usados)) {
                 linea[0] = '\0';
             }
@@ -168,6 +177,10 @@ int red_escuchar(const ConfigTienda *tienda) {
     return fd;
 }
 
+/*
+ * Abre una conexión no bloqueante. Devuelve el socket conectado o -1 con errno.
+ * Si falla después de abrir el socket, lo cierra sin perder la causa del error.
+ */
 static int conectar(const ConfigTienda *destino, int64_t limite) {
     int fd = socket(AF_INET, SOCK_STREAM, 0);
     if (fd == -1) {
@@ -187,6 +200,7 @@ static int conectar(const ConfigTienda *destino, int64_t limite) {
         }
         int error;
         socklen_t largo = sizeof error;
+        // Un socket listo para escritura también puede anunciar una conexión fallida.
         if (getsockopt(fd, SOL_SOCKET, SO_ERROR, &error, &largo) == -1) {
             return cerrar_por_error(fd);
         }
@@ -203,11 +217,13 @@ bool red_fin_solicitado(int fd) {
     return poll(&entrada, 1, 0) > 0 && (entrada.revents & (POLLHUP | POLLERR | POLLNVAL));
 }
 
+// Recepción de solicitudes al propietario
+
 static void atender(int fd, const ServidorRed *servidor) {
     LectorRed lector = {0};
     char linea[RED_MAX_LINEA + 1];
     while (!red_fin_solicitado(servidor->fin)) {
-        // Los bytes de la siguiente línea ya recibidos conservan su hora de llegada.
+        // Si ya se leyó parte de la siguiente línea, su plazo cuenta desde esa lectura.
         int64_t vence = lector.siguiente < lector.fin
                            ? lector.recibido_en + RED_PLAZO_MS : nuevo_plazo();
         ResultadoLinea resultado = leer_linea(fd, &lector, linea, vence);
@@ -219,6 +235,7 @@ static void atender(int fd, const ServidorRed *servidor) {
             !servidor->atender_local(servidor->canal, linea, respuesta)) {
             return;
         }
+        // Si la línea excede el máximo, responde y cierra sin reutilizar el sobrante.
         if (!escribir_linea(fd, respuesta, strlen(respuesta), nuevo_plazo()) ||
             resultado != LINEA_COMPLETA) {
             return;
@@ -241,7 +258,7 @@ void red_recibir(const ServidorRed *servidor) {
         }
         int fd = accept(servidor->escucha, NULL, NULL);
         if (fd == -1) {
-            // Si el otro receptor ya aceptó la conexión, se vuelve a esperar.
+            // El otro receptor pudo aceptar la conexión después de poll.
             if (errno == EINTR || errno == ECONNABORTED || errno == EAGAIN || errno == EWOULDBLOCK) {
                 continue;
             }

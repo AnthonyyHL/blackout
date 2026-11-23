@@ -39,7 +39,13 @@ static size_t lugar(const CambioLista *cambio, size_t tienda) {
     return cambio->cantidad;
 }
 
-// Devuelve 1 si el historial confirma el importe, 0 si falta y -1 si hay un fallo o conflicto.
+// Inventarios de las tiendas
+
+/*
+ * Consulta si una tienda ya aplicó la venta. La versión identifica la lista
+ * que se está comprobando. Devuelve 1 si confirma el importe, 0 si falta
+ * y -1 si falla la consulta o se recibe una respuesta distinta de las esperadas.
+ */
 static int tiene_venta(const ConfigTienda *par, const char *cadena, const char *origen,
                        int64_t secuencia, int64_t importe, uint32_t version, int fin, int64_t vence) {
     char respuesta[RED_MAX_LINEA + 1], esperada[64];
@@ -54,9 +60,14 @@ static int tiene_venta(const ConfigTienda *par, const char *cadena, const char *
     return strcmp(respuesta, esperada) == 0 ? 1 : -1;
 }
 
+/*
+ * Recorre la lista para una venta conocida por algún par.
+ * Devuelve true si cada miembro ya la tenía o confirma que acaba de aplicarla.
+ * Si el origen sigue presente, primero verifica que el importe coincide en su historial.
+ */
 static bool reproducir(const Configuracion *config, const char *cadena, const CambioLista *cambio,
                        size_t origen, int64_t secuencia, int64_t importe, int fin, int64_t vence) {
-    size_t previa = lugar(cambio, origen);
+    size_t previa = lugar(cambio, origen); // cantidad señala un origen ausente de la lista.
     const char *id_origen = config->tiendas[origen].id;
     if (previa < cambio->cantidad &&
         tiene_venta(&config->tiendas[origen], cadena, id_origen, secuencia, importe,
@@ -73,6 +84,7 @@ static bool reproducir(const Configuracion *config, const char *cadena, const Ca
         if (tiene < 0) {
             return false;
         }
+        // Un registro con el mismo importe permite avanzar sin volver a aplicar la venta.
         if (tiene == 1) {
             previa = i;
             continue;
@@ -98,8 +110,9 @@ static bool reproducir(const Configuracion *config, const char *cadena, const Ca
 }
 
 /*
- * Lee ventas aplicadas de cada archivo a través de su propietario.
- * Repetir un ID al encontrarlo en otro inventario es seguro.
+ * Pide a cada propietario sus ventas y las comprueba en las demás tiendas.
+ * Devuelve true si todas confirman cada venta. Cuando reaparece el mismo
+ * identificador en otro inventario, se comprueba de nuevo su importe.
  */
 bool recuperacion_sincronizar(const Configuracion *config, const char *cadena,
                              const CambioLista *cambio, int fin, int64_t vence) {
@@ -134,6 +147,13 @@ bool recuperacion_sincronizar(const Configuracion *config, const char *cadena,
     return true;
 }
 
+// Acuerdo y búsqueda de una lista de participantes
+
+/*
+ * Pide comprobar el orden de la lista propuesta y, si hace falta, recuperar ventas.
+ * Devuelve true cuando todas las tiendas confirman que instalaron la lista.
+ * Si falla antes de instalar, intenta cancelar la propuesta en las tiendas alcanzables.
+ */
 bool recuperacion_acordar(const Configuracion *config, const ConfigTienda *propia,
                           const CambioLista *cambio, int fin) {
     const char *cadena = config->cadenas[propia->cadena].id;
@@ -161,6 +181,7 @@ bool recuperacion_acordar(const Configuracion *config, const ConfigTienda *propi
                     strcmp(respuesta, "VERIFICADO\n") == 0;
         }
     }
+    // Una baja cambia el recorrido. El retorno o reinicio también debe recuperar ventas.
     if (listo && cambio->tipo != 'B' && cambio->tipo != 'M') {
         listo = recuperacion_sincronizar(config, cadena, cambio, fin, vence);
     }
@@ -172,7 +193,7 @@ bool recuperacion_acordar(const Configuracion *config, const ConfigTienda *propi
         }
         return false;
     }
-    // Tras empezar a instalar no se revierte una lista que algún par pudo guardar.
+    // Si alguna tienda ya pudo guardar la lista, se conserva el resultado parcial.
     bool instalada = true;
     for (size_t i = 0; i < cambio->cantidad; ++i) {
         const ConfigTienda *par = &config->tiendas[cambio->orden[i]];
@@ -185,6 +206,12 @@ bool recuperacion_acordar(const Configuracion *config, const ConfigTienda *propi
     return instalada;
 }
 
+/*
+ * Busca la primera tienda de la lista de mayor versión anunciada, si está activa.
+ * Al pedirle retorno o reanudación, true solo indica que recibió una respuesta.
+ * Si no hay tienda activa, la primera de la lista guardada intenta acordar
+ * el reinicio cuando responden los miembros de esa versión.
+ */
 bool recuperacion_buscar(const Configuracion *config, const ConfigTienda *propia,
                          const CambioLista *guardada, int fin) {
     size_t yo = (size_t)(propia - config->tiendas);
@@ -219,6 +246,7 @@ bool recuperacion_buscar(const Configuracion *config, const ConfigTienda *propia
             ++presentes;
         }
         if (version >= mayor) {
+            // Una primera tienda de una versión anterior deja de ser candidata.
             if (version > mayor) {
                 entrada = NULL;
                 mayor = version;

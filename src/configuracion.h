@@ -36,7 +36,7 @@ typedef struct {
     char direccion[16];
     uint16_t puerto;
     char historial[CONFIG_MAX_RUTA + 1];
-    int cadena;
+    int cadena; // Índice en cadenas. CONFIG_SIN_CADENA identifica una independiente.
     ConfigCompras compras;
 } ConfigTienda;
 
@@ -48,7 +48,7 @@ typedef struct {
     int64_t limite_gubernamental_centavos;
     ConfigInterrupciones interrupciones;
     unsigned semilla_azar;
-    bool semilla_configurada;
+    bool semilla_configurada; // Distingue null de una semilla explícita, incluso cero.
 } Configuracion;
 
 bool configuracion_cargar(const char *ruta, Configuracion *config,
